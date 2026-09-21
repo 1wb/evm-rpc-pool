@@ -1,0 +1,34 @@
+{
+  "name": "evm-rpc-pool",
+  "version": "0.1.0",
+  "description": "Zero-dependency EVM JSON-RPC endpoint pool: sticky-priority failover, error-classified cooldowns, half-open probes, adaptive eth_getLogs splitting. 零依赖 EVM JSON-RPC 端点池。",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:1wb/evm-rpc-pool",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
