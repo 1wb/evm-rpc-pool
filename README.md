@@ -10,8 +10,8 @@ Runs on Node ≥18, Bun, and Cloudflare Workers.
 ## Install / 安装（git 依赖）
 
 ```bash
-pnpm add github:1wb/evm-rpc-pool#v0.1.0
-# 或 npm i github:1wb/evm-rpc-pool#v0.1.0
+pnpm add github:1wb/evm-rpc-pool#v0.1.1
+# 或 npm i github:1wb/evm-rpc-pool#v0.1.1
 ```
 
 ## Usage
