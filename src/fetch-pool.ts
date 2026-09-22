@@ -107,6 +107,8 @@ export class FetchRpcPool {
     toBlock: number | bigint;
   }): Promise<T[]> {
     const range: BlockRange = { fromBlock: BigInt(opts.fromBlock), toBlock: BigInt(opts.toBlock) };
+    // 按 topics 形状自动派生 lane：存在非 null topic 走 topic 通道（null 占位不算），否则 address 通道
+    const lane: "topic" | "address" = opts.topics.some((t) => t != null) ? "topic" : "address";
     return this.pool.callLogs<T>(range, async (c, r) => {
       const result = (await attemptJsonRpc(c, "eth_getLogs", [
         {
@@ -117,7 +119,7 @@ export class FetchRpcPool {
         },
       ])) as T[];
       return Array.isArray(result) ? result : [];
-    });
+    }, { lane });
   }
 
   snapshot() {

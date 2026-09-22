@@ -193,6 +193,33 @@ describe("FetchRpcPool.getLogs", () => {
   });
 });
 
+// ---------- getLogs lane 自动派生 ----------
+
+describe("getLogs lane 自动派生", () => {
+  it("带 topic → topic lane（吃 topicLogRange caps）；空 topics → address lane", async () => {
+    const topicCalls: number[] = [];
+    const addrCalls: number[] = [];
+    const { fn } = makeFetch({
+      [URL_A]: (body) => {
+        const { from, to } = getLogsParams(body);
+        const hasTopics = ((body.params as [Record<string, unknown>])[0].topics as unknown[]).length > 0;
+        const span = to - from + 1;
+        if (hasTopics) { topicCalls.push(span); if (span > 3000) return rpcError("too wide"); }
+        else { addrCalls.push(span); if (span > 1000) return rpcError("too wide"); }
+        return ok([]);
+      },
+    });
+    const pool = new FetchRpcPool([URL_A], {
+      fetchImpl: fn,
+      hostCaps: { "a.example": { topicLogRange: 3000, addressLogRange: 1000 } },
+    });
+    await pool.getLogs({ address: "0xp", topics: ["0xt"], fromBlock: 0, toBlock: 9999 });
+    await pool.getLogs({ address: "0xp", topics: [], fromBlock: 0, toBlock: 9999 });
+    expect(topicCalls.every((s) => s <= 3000)).toBe(true);
+    expect(addrCalls.every((s) => s <= 1000)).toBe(true);
+  });
+});
+
 // ---------- 工厂层专项 ----------
 
 describe("FetchRpcPool 工厂", () => {
