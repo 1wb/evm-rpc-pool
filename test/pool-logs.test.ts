@@ -86,3 +86,59 @@ describe("RpcPool.callLogs", () => {
     expect(calls).toBe(0);
   });
 });
+
+describe("v0.2.0 数值 caps 与分桶学习", () => {
+  const URL_A = "https://a.example/rpc";
+  const URL_B = "https://b.example/rpc";
+
+  it("caps 数值初始值按 lane 独立预分块，学习只收紧各自通道", async () => {
+    const pool = new RpcPool<string>([
+      { url: URL_A, client: "A", caps: { topicLogRange: 3000, addressLogRange: 8000 } },
+    ]);
+    const topicSpans: bigint[] = [];
+    const addrSpans: bigint[] = [];
+    await pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 9999n },
+      async (_c, r) => { topicSpans.push(r.toBlock - r.fromBlock + 1n); return []; },
+      { lane: "topic" });
+    await pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 9999n },
+      async (_c, r) => { addrSpans.push(r.toBlock - r.fromBlock + 1n); return []; },
+      { lane: "address" });
+    expect(topicSpans[0]).toBe(3000n);
+    expect(addrSpans[0]).toBe(8000n);
+    // topic 通道学习 2000 不影响 address 通道的 8000。
+    // 该次调用最终失败：拆到 MIN_CHUNK(2000) 仍 >= 2000n 超限、无下家可滑——但学习值已在拆分前落桶。
+    await expect(
+      pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 9999n },
+        async (_c, r) => { topicSpans.push(r.toBlock - r.fromBlock + 1n);
+          if (r.toBlock - r.fromBlock + 1n >= 2000n) throw new Error("block range too wide");
+          return []; },
+        { lane: "topic" }),
+    ).rejects.toThrow("block range too wide");
+    expect(pool.snapshot()[0].maxTopicRange).toBe(2000n);
+    expect(pool.snapshot()[0].maxAddressRange).toBe(8000n);
+  });
+
+  it("topicLogRange<=0 视同不支持：topic 查询跳过该端点，address 查询可用", async () => {
+    const seen: string[] = [];
+    const pool = new RpcPool<string>([
+      { url: URL_A, client: "A", caps: { topicLogRange: 0, addressLogRange: 1000 } },
+      { url: URL_B, client: "B" },
+    ]);
+    await pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 99n },
+      async (c) => { seen.push(c); return []; }, { lane: "topic" });
+    expect(seen).toEqual(["B"]);
+    await pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 99n },
+      async (c) => { seen.push(c); return []; }, { lane: "address" });
+    expect(seen).toEqual(["B", "A"]); // address lane 下 A 仍是首选
+  });
+
+  it("缺省 lane = topic；maxLogRange 别名 = maxTopicRange", async () => {
+    const pool = new RpcPool<string>([{ url: URL_A, client: "A", caps: { topicLogRange: 2500 } }]);
+    await pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 9999n },
+      async (_c, r) => (r.toBlock - r.fromBlock + 1n > 2500n ? Promise.reject(new Error("Query returned more than 2500 blocks range")) : []));
+    const s = pool.snapshot()[0];
+    expect(s.maxLogRange).toBe(2500n);
+    expect(s.maxTopicRange).toBe(2500n);
+    expect(s.maxAddressRange).toBeNull();
+  });
+});

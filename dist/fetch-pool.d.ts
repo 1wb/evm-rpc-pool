@@ -31,6 +31,8 @@ export declare class FetchRpcPool {
         host: string;
         failures: number;
         cooldownSec: number;
+        maxTopicRange: bigint | null;
+        maxAddressRange: bigint | null;
         maxLogRange: bigint | null;
     }[];
 }

@@ -6,8 +6,12 @@ import { redactError, redactUrl } from "./redact.js";
 import { hostOf } from "./url.js";
 
 export interface EntryCaps {
-  /** 是否支持按 topic 过滤的 getLogs（false = getLogs 候选中跳过该端点） */
+  /** 是否支持按 topic 过滤的 getLogs（false = topic 候选中跳过该端点） */
   topicLogs?: boolean;
+  /** topic 查询单次最大块跨度；<=0 视同不支持该 lane */
+  topicLogRange?: number;
+  /** address-only 查询单次最大块跨度；<=0 视同不支持该 lane */
+  addressLogRange?: number;
 }
 
 export interface RpcPoolEntry<C> {
@@ -36,12 +40,29 @@ export class PoolCoolingError extends Error {
 /** 端点健康但本次调用失败（rejected/reverted/range 拆到下限），滑下家不冷却。 */
 class SlideSignal extends Error {}
 
+/** getLogs 查询通道：topic = 带 topic 过滤；address = 仅按地址过滤。 */
+export type LogLane = "topic" | "address";
+
+/** caps 数值 → 初始学习值；缺省或 <=0 视同未声明（null = 无已学上限，不预分块）。 */
+function capsInitial(n: number | undefined): bigint | null {
+  return n != null && n > 0 ? BigInt(n) : null;
+}
+
+/** 数值 caps 的 lane 支持判定：缺省视为支持，<=0 视同不支持该 lane。 */
+function laneSupported(n: number | undefined): boolean {
+  return n === undefined || n > 0;
+}
+
 function kindOf(error: unknown): RpcErrorKind {
   if (error instanceof RpcKindError) return error.kind;
   return classifyRpcError(error);
 }
 
-type EntryState<C> = RpcPoolEntry<C> & { breaker: EndpointBreaker; maxLogRange: bigint | null };
+type EntryState<C> = RpcPoolEntry<C> & {
+  breaker: EndpointBreaker;
+  maxTopicRange: bigint | null;
+  maxAddressRange: bigint | null;
+};
 
 export class RpcPool<C> {
   private readonly entries: Array<EntryState<C>>;
@@ -58,7 +79,8 @@ export class RpcPool<C> {
         archive: opts.archive,
         transient: opts.transient,
       }),
-      maxLogRange: null,
+      maxTopicRange: capsInitial(e.caps?.topicLogRange),
+      maxAddressRange: capsInitial(e.caps?.addressLogRange),
     }));
   }
 
@@ -89,25 +111,46 @@ export class RpcPool<C> {
     throw new Error(`RPC 全部 ${attempts} 端点失败: ${reasons.join(" | ").slice(0, 300)}`);
   }
 
-  snapshot(): Array<{ host: string; failures: number; cooldownSec: number; maxLogRange: bigint | null }> {
+  snapshot(): Array<{
+    host: string;
+    failures: number;
+    cooldownSec: number;
+    maxTopicRange: bigint | null;
+    maxAddressRange: bigint | null;
+    /** 弃用别名 = maxTopicRange（topic 通道学习值），供 v0.1.x 消费方过渡 */
+    maxLogRange: bigint | null;
+  }> {
     const now = this.now();
     return this.entries.map((e) => {
       const s = e.breaker.snapshot(now);
-      return { host: hostOf(e.url), failures: s.failures, cooldownSec: s.cooldownSec, maxLogRange: e.maxLogRange };
+      return {
+        host: hostOf(e.url),
+        failures: s.failures,
+        cooldownSec: s.cooldownSec,
+        maxTopicRange: e.maxTopicRange,
+        maxAddressRange: e.maxAddressRange,
+        maxLogRange: e.maxTopicRange,
+      };
     });
   }
 
   /**
-   * getLogs：与 call 同候选序，但先按 caps 过滤（全部无 caps 则用全体），
-   * 再按端点已学范围预分块；范围超限在端点内自适应拆分（提取上限一次切到位/对半二分），
+   * getLogs：与 call 同候选序，但先按 caps 与 lane 过滤（过滤后为空则用全体），
+   * 再按端点在对应 lane 已学的范围预分块；范围超限在端点内自适应拆分（提取上限一次切到位/对半二分），
    * 拆到 MIN_CHUNK 仍失败才滑下家。块号 bigint，from > to 返回 []。
+   * lane 缺省 "topic"；学习值按 lane 分桶（maxTopicRange / maxAddressRange），只收紧取历史最小。
    */
   async callLogs<T>(
     range: BlockRange,
     fn: (client: C, range: BlockRange) => Promise<readonly T[]>,
+    opts: { lane?: LogLane } = {},
   ): Promise<T[]> {
+    const lane: LogLane = opts.lane ?? "topic";
     if (range.fromBlock > range.toBlock) return [];
-    const capable = this.entries.filter((e) => e.caps?.topicLogs !== false);
+    const capable = this.entries.filter((e) => {
+      if (lane === "topic") return e.caps?.topicLogs !== false && laneSupported(e.caps?.topicLogRange);
+      return laneSupported(e.caps?.addressLogRange);
+    });
     const candidates = capable.length ? capable : this.entries;
     const reasons: string[] = [];
     let attempts = 0;
@@ -116,13 +159,14 @@ export class RpcPool<C> {
       attempts += 1;
       try {
         const span = range.toBlock - range.fromBlock + 1n;
+        const learned = lane === "topic" ? e.maxTopicRange : e.maxAddressRange;
         const initial =
-          e.maxLogRange !== null && e.maxLogRange < span
-            ? splitBlockRange(range.fromBlock, range.toBlock, e.maxLogRange).map((p) => ({ fromBlock: p.from, toBlock: p.to }))
+          learned !== null && learned < span
+            ? splitBlockRange(range.fromBlock, range.toBlock, learned).map((p) => ({ fromBlock: p.from, toBlock: p.to }))
             : [range];
         const out: T[] = [];
         for (const part of initial) {
-          out.push(...(await this.logsRange(e, fn, part)));
+          out.push(...(await this.logsRange(e, fn, part, lane)));
         }
         e.breaker.report("ok");
         return out;
@@ -139,6 +183,7 @@ export class RpcPool<C> {
     e: EntryState<C>,
     fn: (client: C, range: BlockRange) => Promise<readonly T[]>,
     range: BlockRange,
+    lane: LogLane,
   ): Promise<T[]> {
     let result: readonly T[];
     try {
@@ -149,13 +194,17 @@ export class RpcPool<C> {
       if (kind === "range" && span > MIN_CHUNK) {
         const parsed =
           error instanceof RpcKindError ? error.rangeLimit : rangeLimitFromMessage(error instanceof Error ? error.message : String(error));
-        // 能读出上限一次切到位，读不出对半二分；下限 MIN_CHUNK 兜底，学习值取历史最小
+        // 能读出上限一次切到位，读不出对半二分；下限 MIN_CHUNK 兜底，学习值按 lane 分桶、取历史最小
         const chunk = parsed !== null && parsed < span ? parsed : (span + 1n) / 2n;
         const eff = chunk > MIN_CHUNK ? chunk : MIN_CHUNK;
-        e.maxLogRange = e.maxLogRange === null ? eff : (eff < e.maxLogRange ? eff : e.maxLogRange);
+        if (lane === "topic") {
+          e.maxTopicRange = e.maxTopicRange === null ? eff : (eff < e.maxTopicRange ? eff : e.maxTopicRange);
+        } else {
+          e.maxAddressRange = e.maxAddressRange === null ? eff : (eff < e.maxAddressRange ? eff : e.maxAddressRange);
+        }
         const out: T[] = [];
         for (const part of splitBlockRange(range.fromBlock, range.toBlock, eff)) {
-          out.push(...(await this.logsRange(e, fn, { fromBlock: part.from, toBlock: part.to })));
+          out.push(...(await this.logsRange(e, fn, { fromBlock: part.from, toBlock: part.to }, lane)));
         }
         return out;
       }
