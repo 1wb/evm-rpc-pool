@@ -72,6 +72,8 @@ export class FetchRpcPool {
     /** fromBlock/toBlock 接受 number 或 bigint（number 侧为历史消费方便利），内部统一 bigint。 */
     getLogs(opts) {
         const range = { fromBlock: BigInt(opts.fromBlock), toBlock: BigInt(opts.toBlock) };
+        // 按 topics 形状自动派生 lane：存在非 null topic 走 topic 通道（null 占位不算），否则 address 通道
+        const lane = opts.topics.some((t) => t != null) ? "topic" : "address";
         return this.pool.callLogs(range, async (c, r) => {
             const result = (await attemptJsonRpc(c, "eth_getLogs", [
                 {
@@ -82,7 +84,7 @@ export class FetchRpcPool {
                 },
             ]));
             return Array.isArray(result) ? result : [];
-        });
+        }, { lane });
     }
     snapshot() {
         return this.pool.snapshot();

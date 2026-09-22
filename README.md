@@ -57,6 +57,10 @@ import { EndpointBreaker, classifyRpcError } from "evm-rpc-pool";
   data 或自定义错误选择器；文案不含该短语的执行失败会被归入其他分型，需要精确判定请走
   自定义传输（`RpcPool`）并在回调内自行识别。
 - 所有错误信息与快照对 URL 脱敏（只留协议与 host），key 不落日志。
+- **v0.2.0 数值能力表与分桶学习**：`EntryCaps` 支持 `topicLogRange` / `addressLogRange`
+  （单次最大块跨度，`<=0` 视同不支持该类查询）；学习值按 lane（topic / address）独立分桶；
+  `getLogs` 按 topics 形状自动选择 lane，`RpcPool.callLogs` 可显式传 `{ lane }`。
+  snapshot 的 `maxLogRange` 为 `maxTopicRange` 的弃用别名。
 
 ## License
 

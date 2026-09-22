@@ -1,6 +1,6 @@
 {
   "name": "evm-rpc-pool",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Zero-dependency EVM JSON-RPC endpoint pool: sticky-priority failover, error-classified cooldowns, half-open probes, adaptive eth_getLogs splitting. 零依赖 EVM JSON-RPC 端点池。",
   "type": "module",
   "license": "MIT",
