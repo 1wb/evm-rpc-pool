@@ -111,3 +111,76 @@ describe("RpcPool.call 粘性优先", () => {
     expect(() => new RpcPool([])).toThrow();
   });
 });
+
+const URL_C = "https://c.example/rpc";
+
+describe("RpcPool.call selection=rotation", () => {
+  it("活端点间轮转: 三端点依次 A→B→C→A", async () => {
+    const pool = new RpcPool<string>(
+      [
+        { url: URL_A, client: "A" },
+        { url: URL_B, client: "B" },
+        { url: URL_C, client: "C" },
+      ],
+      { selection: "rotation" },
+    );
+    const seen: string[] = [];
+    const pick = async (c: string) => { seen.push(c); return c; };
+    for (let i = 0; i < 4; i++) await pool.call(pick);
+    expect(seen).toEqual(["A", "B", "C", "A"]);
+  });
+
+  it("冷却端点当轮不占候选位, 冷却到期后轮转指针继续推进", async () => {
+    const clock = makeClock();
+    const pool = new RpcPool<string>(
+      [
+        { url: URL_A, client: "A" },
+        { url: URL_B, client: "B" },
+      ],
+      { selection: "rotation", now: clock.now },
+    );
+    const seen: string[] = [];
+    let bQuota = false;
+    const pick = async (c: string) => {
+      seen.push(c);
+      if (c === "B" && bQuota) throw new RpcKindError("quota", "HTTP 429");
+      return c;
+    };
+    expect(await pool.call(pick)).toBe("A"); // 指针0 → [A,B], A 成功
+    bQuota = true;
+    expect(await pool.call(pick)).toBe("A"); // 指针1 → [B,A], B quota → 冷却 → 滑 A
+    expect(await pool.call(pick)).toBe("A"); // 活集=[A], B 不占候选位
+    expect(await pool.call(pick)).toBe("A");
+    clock.tick(120_000); // B 冷却到期(quota 基础 120s)
+    bQuota = false;
+    expect(await pool.call(pick)).toBe("A"); // 指针4, 活集[A,B] → start 0 → [A,B]
+    expect(await pool.call(pick)).toBe("B"); // 指针5 → start 1 → [B,A]
+    expect(seen).toEqual(["A", "B", "A", "A", "A", "A", "B"]);
+    // 注：断言点在 B 成功调用（report("ok") 清零）之后，failures 必为 0；冷却行为已由 seen 序列证明
+    expect(pool.snapshot()[1]).toMatchObject({ host: "b.example", failures: 0, cooldownSec: 0 });
+  });
+
+  it("全冷却时 PoolCoolingError 语义不变", async () => {
+    const clock = makeClock();
+    const pool = new RpcPool<string>([{ url: URL_A, client: "A" }], { selection: "rotation", now: clock.now });
+    // 注：首败抛聚合错是 call() 既有契约（同现有 priority 用例），须 rejects 接住
+    await expect(pool.call(async () => { throw new RpcKindError("quota", "HTTP 429"); })).rejects.toThrow(/全部 1 端点失败/);
+    await expect(pool.call(async (c) => c)).rejects.toBeInstanceOf(PoolCoolingError);
+  });
+});
+
+describe("RpcPool.call selection=priority (默认语义锁定)", () => {
+  it("显式 priority 与默认一致: 恒首选", async () => {
+    const pool = new RpcPool<string>(
+      [
+        { url: URL_A, client: "A" },
+        { url: URL_B, client: "B" },
+      ],
+      { selection: "priority" },
+    );
+    const seen: string[] = [];
+    const pick = async (c: string) => { seen.push(c); return c; };
+    for (let i = 0; i < 3; i++) await pool.call(pick);
+    expect(seen).toEqual(["A", "A", "A"]);
+  });
+});

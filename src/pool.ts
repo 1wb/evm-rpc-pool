@@ -20,11 +20,17 @@ export interface RpcPoolEntry<C> {
   caps?: EntryCaps;
 }
 
+/** 候选排序策略：priority = 粘性优先（默认, v0.2.0 语义）；rotation = 活端点轮转。 */
+export type PoolSelection = "priority" | "rotation";
+
 export interface RpcPoolOptions {
   now?: () => number;
   quota?: BreakerTuning;
   archive?: BreakerTuning;
   transient?: BreakerTuning;
+  /** 候选排序：'priority'（默认）恒按构造序过滤冷却从首个试起；'rotation' 从轮转指针起
+   *  对活端点循环排列（冷却端点当轮不占候选位；全冷却时对全体循环兜底保进度）。 */
+  selection?: PoolSelection;
 }
 
 /** 全部端点均在冷却（含探针在途）时抛出，带最早可重试时间与脱敏标签。 */
@@ -67,10 +73,13 @@ type EntryState<C> = RpcPoolEntry<C> & {
 export class RpcPool<C> {
   private readonly entries: Array<EntryState<C>>;
   private readonly now: () => number;
+  private readonly selection: PoolSelection;
+  private rotationIndex = 0;
 
   constructor(entries: readonly RpcPoolEntry<C>[], opts: RpcPoolOptions = {}) {
     if (!entries.length) throw new Error("RpcPool: 端点列表为空");
     this.now = opts.now ?? Date.now;
+    this.selection = opts.selection ?? "priority";
     this.entries = entries.map((e) => ({
       ...e,
       breaker: new EndpointBreaker({
@@ -84,6 +93,20 @@ export class RpcPool<C> {
     }));
   }
 
+  /** selection 候选排序。rotation: 只读 snapshot 预筛活端点（不触碰 begin() 的半开探针
+   *  副作用），从轮转指针起对活集循环排列；指针每调用递增，冷却端点当轮不占候选位
+   *  （活集大小变化由 mod 吸收）；全冷却时对全体循环兜底保进度。熔断 begin/report 按
+   *  返回候选序在调用处执行，与 priority 完全共用。 */
+  private ordered(entries: EntryState<C>[]): EntryState<C>[] {
+    if (this.selection === "priority") return entries;
+    const now = this.now();
+    const live = entries.filter((e) => e.breaker.snapshot(now).cooldownSec <= 0);
+    const pool = live.length > 0 ? live : entries;
+    const start = this.rotationIndex % pool.length;
+    this.rotationIndex += 1;
+    return [...pool.slice(start), ...pool.slice(0, start)];
+  }
+
   /**
    * 粘性优先通用调用：恒按构造序过滤冷却端点，从首个开始试；
    * rejected/reverted 滑下家不冷却，quota/archive/transient 冷却后滑下家，ok 清零。
@@ -92,7 +115,7 @@ export class RpcPool<C> {
   async call<T>(fn: (client: C, url: string) => Promise<T>): Promise<T> {
     const reasons: string[] = [];
     let attempts = 0;
-    for (const e of this.entries) {
+    for (const e of this.ordered(this.entries)) {
       if (!e.breaker.begin()) continue;
       attempts += 1;
       try {
@@ -154,7 +177,7 @@ export class RpcPool<C> {
     const candidates = capable.length ? capable : this.entries;
     const reasons: string[] = [];
     let attempts = 0;
-    for (const e of candidates) {
+    for (const e of this.ordered(candidates)) {
       if (!e.breaker.begin()) continue;
       attempts += 1;
       try {
