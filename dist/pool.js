@@ -32,10 +32,13 @@ function kindOf(error) {
 export class RpcPool {
     entries;
     now;
+    selection;
+    rotationIndex = 0;
     constructor(entries, opts = {}) {
         if (!entries.length)
             throw new Error("RpcPool: 端点列表为空");
         this.now = opts.now ?? Date.now;
+        this.selection = opts.selection ?? "priority";
         this.entries = entries.map((e) => ({
             ...e,
             breaker: new EndpointBreaker({
@@ -48,6 +51,20 @@ export class RpcPool {
             maxAddressRange: capsInitial(e.caps?.addressLogRange),
         }));
     }
+    /** selection 候选排序。rotation: 只读 snapshot 预筛活端点（不触碰 begin() 的半开探针
+     *  副作用），从轮转指针起对活集循环排列；指针每调用递增，冷却端点当轮不占候选位
+     *  （活集大小变化由 mod 吸收）；全冷却时对全体循环兜底保进度。熔断 begin/report 按
+     *  返回候选序在调用处执行，与 priority 完全共用。 */
+    ordered(entries) {
+        if (this.selection === "priority")
+            return entries;
+        const now = this.now();
+        const live = entries.filter((e) => e.breaker.snapshot(now).cooldownSec <= 0);
+        const pool = live.length > 0 ? live : entries;
+        const start = this.rotationIndex % pool.length;
+        this.rotationIndex += 1;
+        return [...pool.slice(start), ...pool.slice(0, start)];
+    }
     /**
      * 粘性优先通用调用：恒按构造序过滤冷却端点，从首个开始试；
      * rejected/reverted 滑下家不冷却，quota/archive/transient 冷却后滑下家，ok 清零。
@@ -56,7 +73,7 @@ export class RpcPool {
     async call(fn) {
         const reasons = [];
         let attempts = 0;
-        for (const e of this.entries) {
+        for (const e of this.ordered(this.entries)) {
             if (!e.breaker.begin())
                 continue;
             attempts += 1;
@@ -109,7 +126,7 @@ export class RpcPool {
         const candidates = capable.length ? capable : this.entries;
         const reasons = [];
         let attempts = 0;
-        for (const e of candidates) {
+        for (const e of this.ordered(candidates)) {
             if (!e.breaker.begin())
                 continue;
             attempts += 1;
