@@ -4,10 +4,11 @@ export interface BreakerTuning {
   capMs: number;
 }
 
-export type CoolingKind = "quota" | "transient" | "archive";
+export type CoolingKind = "quota" | "rate" | "transient" | "archive";
 
 export const DEFAULT_TUNING: Record<CoolingKind, BreakerTuning> = {
   quota: { baseMs: 2 * 60_000, factor: 4, capMs: 6 * 3_600_000 },
+  rate: { baseMs: 30_000, factor: 2, capMs: 10 * 60_000 },
   archive: { baseMs: 30 * 60_000, factor: 2, capMs: 6 * 3_600_000 },
   transient: { baseMs: 30_000, factor: 2, capMs: 10 * 60_000 },
 };
@@ -15,6 +16,7 @@ export const DEFAULT_TUNING: Record<CoolingKind, BreakerTuning> = {
 export interface EndpointBreakerOptions {
   now?: () => number;
   quota?: BreakerTuning;
+  rate?: BreakerTuning;
   archive?: BreakerTuning;
   transient?: BreakerTuning;
 }
@@ -36,6 +38,7 @@ export class EndpointBreaker {
     this.now = opts.now ?? Date.now;
     this.tuning = {
       quota: opts.quota ?? DEFAULT_TUNING.quota,
+      rate: opts.rate ?? DEFAULT_TUNING.rate,
       archive: opts.archive ?? DEFAULT_TUNING.archive,
       transient: opts.transient ?? DEFAULT_TUNING.transient,
     };
@@ -57,7 +60,8 @@ export class EndpointBreaker {
       return;
     }
     this.failures += 1;
-    const { baseMs, factor, capMs } = this.tuning[kind];
+    // 未知 kind（透传消费方带来的新分型）回退 transient 档，不崩
+    const { baseMs, factor, capMs } = this.tuning[kind as CoolingKind] ?? this.tuning.transient;
     this._cooldownUntil = this.now() + Math.min(baseMs * factor ** (this.failures - 1), capMs);
   }
 

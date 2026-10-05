@@ -7,6 +7,30 @@ function makeClock() {
 }
 
 describe("EndpointBreaker", () => {
+  it("rate：30s 起步、×2 递增、封顶 10min", () => {
+    const clock = makeClock();
+    const b = new EndpointBreaker({ now: clock.now });
+    b.report("rate");
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(30);
+    clock.tick(30_000);
+    expect(b.begin()).toBe(true);
+    b.report("rate");
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(60); // 30×2
+    for (let i = 0; i < 6; i++) {
+      clock.tick(10 * 60_000);
+      expect(b.begin()).toBe(true);
+      b.report("rate");
+    }
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(600); // 封顶 10min
+  });
+
+  it("未知 kind 回退 transient 档（透传消费方安全）", () => {
+    const clock = makeClock();
+    const b = new EndpointBreaker({ now: clock.now });
+    expect(() => b.report("nonexistent" as never)).not.toThrow();
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(30); // transient baseMs
+  });
+
   it("新端点直接放行", () => {
     expect(new EndpointBreaker().begin()).toBe(true);
   });

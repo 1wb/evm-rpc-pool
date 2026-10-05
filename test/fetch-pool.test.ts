@@ -57,11 +57,11 @@ describe("FetchRpcPool.call", () => {
     expect(calls.map((c) => c.url)).toEqual([URL_A, URL_A]);
   });
 
-  it("quota：滑下家 + 2min 冷却 + 冷却期跳过 + 到期半开探针", async () => {
+  it("quota（402）：滑下家 + 2min 冷却 + 冷却期跳过 + 到期半开探针", async () => {
     const clock = makeClock();
     let aQuota = true;
     const { fn, calls } = makeFetch({
-      [URL_A]: () => (aQuota ? http(429) : ok("A")),
+      [URL_A]: () => (aQuota ? http(402) : ok("A")),
       [URL_B]: () => ok("B"),
     });
     const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, now: clock.now });
@@ -73,7 +73,7 @@ describe("FetchRpcPool.call", () => {
     expect(await pool.call<string>("eth_blockNumber", [])).toBe("B");
     expect(calls.filter((c) => c.url === URL_A)).toHaveLength(1);
 
-    clock.tick(60_000); // 探针，仍 429 → ×4 = 8min
+    clock.tick(60_000); // 探针，仍 402 → ×4 = 8min
     expect(await pool.call<string>("eth_blockNumber", [])).toBe("B");
     expect(pool.snapshot()[0].cooldownSec).toBe(480);
 
@@ -81,6 +81,23 @@ describe("FetchRpcPool.call", () => {
     aQuota = false;
     expect(await pool.call<string>("eth_blockNumber", [])).toBe("A");
     expect(pool.snapshot()[0]).toMatchObject({ failures: 0, cooldownSec: 0 });
+  });
+
+  it("rate（429）：短梯 30s 起步 ×2——短时限流不再被停用 6 小时", async () => {
+    const clock = makeClock();
+    let aRate = true;
+    const { fn } = makeFetch({
+      [URL_A]: () => (aRate ? http(429) : ok("A")),
+      [URL_B]: () => ok("B"),
+    });
+    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, now: clock.now });
+
+    expect(await pool.call<string>("eth_blockNumber", [])).toBe("B");
+    expect(pool.snapshot()[0]).toMatchObject({ failures: 1, cooldownSec: 30 });
+
+    clock.tick(30_000); // 冷却到期，A 放行为探针
+    expect(await pool.call<string>("eth_blockNumber", [])).toBe("B");
+    expect(pool.snapshot()[0].cooldownSec).toBe(60); // 30×2
   });
 
   it("rejected（200 带 JSON-RPC error）：不冷却不计数，仅滑下家", async () => {

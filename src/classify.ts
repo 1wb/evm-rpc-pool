@@ -1,4 +1,11 @@
-export type RpcErrorKind = "quota" | "archive" | "transient" | "reverted" | "rejected" | "range";
+export type RpcErrorKind =
+  | "quota"
+  | "rate"
+  | "archive"
+  | "transient"
+  | "reverted"
+  | "rejected"
+  | "range";
 
 /** 预分型错误：fetch 工厂在能确知分型（HTTP 状态、200+JSON-RPC error）时抛出，内核直接采信。 */
 export class RpcKindError extends Error {
@@ -12,9 +19,11 @@ export class RpcKindError extends Error {
   }
 }
 
+// v0.4.0 分型拆分：rate = 短时限流（429/限速文案，30s×2 短梯）；quota = 硬额度（402/额度耗尽，2min×4 长梯）
+export const RATE_TEXT = /\b429\b|too many requests|rate[ -]?(?:limit|exceeded)|request rate/i;
 // quota 正则取两父实现的并集（flower: monthly；bn-alpha: upgrade here）
 export const QUOTA_TEXT =
-  /\b(?:402|429)\b|too many requests|rate[ -]?(?:limit|exceeded)|request rate|usage limit|quota|credits?\s*[\s\S]*(?:limit|exhaust)|current plan|monthly|upgrade here/i;
+  /\b(?:402|403)\b|usage limit|quota|credits?\s*[\s\S]*(?:limit|exhaust)|current plan|monthly|upgrade here/i;
 export const ARCHIVE_TEXT = /archive requests?|archive node|historical (?:data|state)|personal token/i;
 const REVERT_TEXT = /execution reverted/i;
 
@@ -54,6 +63,7 @@ export function classifyRpcError(error: unknown): Exclude<RpcErrorKind, "rejecte
   const msg = error instanceof Error ? error.message : String(error);
   if (isRangeLimitMessage(msg)) return "range";
   if (REVERT_TEXT.test(msg)) return "reverted";
+  if (RATE_TEXT.test(msg)) return "rate";
   if (QUOTA_TEXT.test(msg)) return "quota";
   if (ARCHIVE_TEXT.test(msg)) return "archive";
   return "transient";

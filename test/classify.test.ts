@@ -26,12 +26,16 @@ describe("isRangeLimitMessage", () => {
 });
 
 describe("classifyRpcError", () => {
-  it("quota：状态码数字与限速文案", () => {
-    expect(classifyRpcError(new Error("HTTP 429"))).toBe("quota");
+  it("rate：429 与短时限流文案（区别于硬额度）", () => {
+    expect(classifyRpcError(new Error("HTTP 429"))).toBe("rate");
+    expect(classifyRpcError(new Error("too many requests"))).toBe("rate");
+    expect(classifyRpcError(new Error("request rate exceeded"))).toBe("rate");
+  });
+  it("quota：硬额度（402/额度耗尽文案），rate 判定先于 quota", () => {
     expect(classifyRpcError(new Error("HTTP 402"))).toBe("quota");
-    expect(classifyRpcError(new Error("too many requests"))).toBe("quota");
     expect(classifyRpcError(new Error("credits exhausted"))).toBe("quota");
     expect(classifyRpcError(new Error("monthly quota exceeded"))).toBe("quota");
+    expect(classifyRpcError(new Error("usage limit for your current plan"))).toBe("quota");
   });
   it("archive：历史状态文案", () => {
     expect(classifyRpcError(new Error("archive node required"))).toBe("archive");

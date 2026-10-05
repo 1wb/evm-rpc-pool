@@ -28,7 +28,8 @@ export interface FetchRpcPoolOptions extends RpcPoolOptions {
   hostCaps?: Record<string, EntryCaps>;
 }
 
-const QUOTA_STATUS = new Set([429, 402, 403]);
+const RATE_STATUS = new Set([429]);
+const QUOTA_STATUS = new Set([402, 403]);
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 function timeoutSignal(ms: number): AbortSignal | undefined {
@@ -55,6 +56,7 @@ async function attemptJsonRpc(c: FetchClient, method: string, params: unknown): 
   } catch (err) {
     throw new RpcKindError("transient", String(err).slice(0, 120));
   }
+  if (RATE_STATUS.has(res.status)) throw new RpcKindError("rate", `HTTP ${res.status}`);
   if (QUOTA_STATUS.has(res.status)) throw new RpcKindError("quota", `HTTP ${res.status}`);
   if (!res.ok) throw new RpcKindError("transient", `HTTP ${res.status}`);
   let j: { result?: unknown; error?: unknown };

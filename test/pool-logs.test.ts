@@ -70,7 +70,7 @@ describe("RpcPool.callLogs", () => {
       { url: URL_B, client: "B" },
     ]);
     const fn = async (c: string) => {
-      if (c === "A") throw new Error("HTTP 429"); // 文案经 classifyRpcError → quota
+      if (c === "A") throw new Error("HTTP 402"); // 硬额度 → quota
       return [{ block: 1n }];
     };
     const logs = await pool.callLogs<Logs>({ fromBlock: 0n, toBlock: 9999n }, fn);
