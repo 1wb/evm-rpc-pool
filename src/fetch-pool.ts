@@ -5,6 +5,7 @@ import {
   RpcKindError,
   isContractRevertMessage,
   isRangeLimitMessage,
+  parseRetryAfter,
   rangeLimitFromMessage,
 } from "./classify.js";
 import type { BlockRange } from "./range.js";
@@ -14,6 +15,8 @@ export interface RpcResponse {
   ok: boolean;
   status: number;
   json(): Promise<unknown>;
+  /** Retry-After 提取用；假实现可缺省 */
+  headers?: { get(name: string): string | null };
 }
 
 export type FetchLike = (
@@ -56,7 +59,10 @@ async function attemptJsonRpc(c: FetchClient, method: string, params: unknown): 
   } catch (err) {
     throw new RpcKindError("transient", String(err).slice(0, 120));
   }
-  if (RATE_STATUS.has(res.status)) throw new RpcKindError("rate", `HTTP ${res.status}`);
+  if (RATE_STATUS.has(res.status)) {
+    const retryAfterMs = parseRetryAfter(res.headers?.get("retry-after") ?? null, Date.now());
+    throw new RpcKindError("rate", `HTTP ${res.status}`, null, retryAfterMs);
+  }
   if (QUOTA_STATUS.has(res.status)) throw new RpcKindError("quota", `HTTP ${res.status}`);
   if (!res.ok) throw new RpcKindError("transient", `HTTP ${res.status}`);
   let j: { result?: unknown; error?: unknown };

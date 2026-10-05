@@ -246,7 +246,9 @@ export class RpcPool<C> {
     if (kind === "rejected" || kind === "reverted" || kind === "range" || error instanceof SlideSignal) {
       e.breaker.slide();
     } else {
-      e.breaker.report(kind as CoolingKind);
+      const retryAfterMs =
+        error instanceof RpcKindError && error.retryAfterMs !== null ? error.retryAfterMs : undefined;
+      e.breaker.report(kind as CoolingKind, { retryAfterMs });
     }
     return `${hostOf(e.url)}: ${detail}`;
   }

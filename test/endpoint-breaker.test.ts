@@ -24,6 +24,30 @@ describe("EndpointBreaker", () => {
     expect(b.snapshot(clock.now()).cooldownSec).toBe(600); // 封顶 10min
   });
 
+  it("Retry-After 直取：report 携带 retryAfterMs 时覆盖阶梯（≥5s）", () => {
+    const clock = makeClock();
+    const b = new EndpointBreaker({ now: clock.now });
+    b.report("rate", { retryAfterMs: 120_000 });
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(120); // 直取，不进阶梯
+    clock.tick(30_000);
+    b.begin();
+    b.report("rate"); // 无 Retry-After 回阶梯，但边带是绝对截止：max(阶梯60, penalty剩余90)
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(90);
+  });
+
+  it("setPenalty 边带：冷却取 max(阶梯, penalty)，过期边带失效", () => {
+    const clock = makeClock();
+    const b = new EndpointBreaker({ now: clock.now });
+    b.report("rate"); // 30s 阶梯
+    b.setPenalty(clock.now() + 300_000);
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(300); // max(30, 300)
+    clock.tick(120_000);
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(180); // penalty 仍主导
+    clock.tick(180_000);
+    expect(b.snapshot(clock.now()).cooldownSec).toBe(0); // 过期失效
+    expect(b.begin()).toBe(true);
+  });
+
   it("未知 kind 回退 transient 档（透传消费方安全）", () => {
     const clock = makeClock();
     const b = new EndpointBreaker({ now: clock.now });

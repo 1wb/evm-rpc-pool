@@ -4,6 +4,7 @@ import {
   classifyRpcError,
   isContractRevertMessage,
   isRangeLimitMessage,
+  parseRetryAfter,
   rangeLimitFromMessage,
 } from "../src/classify";
 
@@ -55,5 +56,23 @@ describe("classifyRpcError", () => {
     const e = new RpcKindError("rejected", "method not found");
     expect(e.kind).toBe("rejected");
     expect(e.rangeLimit).toBeNull();
+  });
+});
+
+describe("parseRetryAfter", () => {
+  const NOW = Date.parse("2026-10-06T00:00:00Z");
+  it("秒数格式换算毫秒", () => {
+    expect(parseRetryAfter("30", NOW)).toBe(30_000);
+    expect(parseRetryAfter("120", NOW)).toBe(120_000);
+  });
+  it("HTTP-date 格式换算为距 now 的毫秒", () => {
+    expect(parseRetryAfter("Tue, 06 Oct 2026 00:01:00 GMT", NOW)).toBe(60_000);
+  });
+  it("无效/负数/非有限值回退 null", () => {
+    expect(parseRetryAfter("-5", NOW)).toBeNull();
+    expect(parseRetryAfter("abc", NOW)).toBeNull();
+    expect(parseRetryAfter("Infinity", NOW)).toBeNull();
+    expect(parseRetryAfter("0", NOW)).toBeNull();
+    expect(parseRetryAfter(null, NOW)).toBeNull();
   });
 });

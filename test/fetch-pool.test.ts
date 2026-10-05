@@ -14,8 +14,14 @@ function ok(result: unknown): RpcResponse {
 function rpcError(message: string): RpcResponse {
   return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, error: { code: -32005, message } }) };
 }
-function http(status: number): RpcResponse {
-  return { ok: status >= 200 && status < 300, status, json: async () => ({}) };
+function http(status: number, headers?: Record<string, string>): RpcResponse {
+  const h = new Map(Object.entries(headers ?? {}));
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => ({}),
+    headers: { get: (name: string) => h.get(name.toLowerCase()) ?? null },
+  };
 }
 
 function makeFetch(handlers: Record<string, Handler>) {
@@ -81,6 +87,13 @@ describe("FetchRpcPool.call", () => {
     aQuota = false;
     expect(await pool.call<string>("eth_blockNumber", [])).toBe("A");
     expect(pool.snapshot()[0]).toMatchObject({ failures: 0, cooldownSec: 0 });
+  });
+
+  it("429 + Retry-After 头：冷却直取 45s（聚合错误不出池，breaker 行为是可观察面）", async () => {
+    const { fn } = makeFetch({ [URL_A]: () => http(429, { "retry-after": "45" }) });
+    const pool = new FetchRpcPool([URL_A], { fetchImpl: fn });
+    await expect(pool.call<string>("eth_blockNumber", [])).rejects.toThrow(/全部 1 端点失败/);
+    expect(pool.snapshot()[0].cooldownSec).toBe(45); // 直取，非 rate 档 30s 阶梯
   });
 
   it("rate（429）：短梯 30s 起步 ×2——短时限流不再被停用 6 小时", async () => {
