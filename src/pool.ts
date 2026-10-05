@@ -80,6 +80,8 @@ function kindOf(error: unknown): RpcErrorKind {
 }
 
 type EntryState<C> = RpcPoolEntry<C> & {
+  /** 匿名 key 编号 host#kN（构造序按 host 计数）——摘要/探测/计量的稳定引用 */
+  keyId: string;
   breaker: EndpointBreaker;
   maxTopicRange: bigint | null;
   maxAddressRange: bigint | null;
@@ -98,17 +100,24 @@ export class RpcPool<C> {
     this.now = opts.now ?? Date.now;
     this.selection = opts.selection ?? "priority";
     this.rateLimiter = opts.rateLimiter;
-    this.entries = entries.map((e) => ({
-      ...e,
-      breaker: new EndpointBreaker({
-        now: opts.now,
-        quota: opts.quota,
-        archive: opts.archive,
-        transient: opts.transient,
-      }),
-      maxTopicRange: capsInitial(e.caps?.topicLogRange),
-      maxAddressRange: capsInitial(e.caps?.addressLogRange),
-    }));
+    const hostSeq = new Map<string, number>();
+    this.entries = entries.map((e) => {
+      const host = hostOf(e.url);
+      const seq = (hostSeq.get(host) ?? 0) + 1;
+      hostSeq.set(host, seq);
+      return {
+        ...e,
+        keyId: `${host}#k${seq}`,
+        breaker: new EndpointBreaker({
+          now: opts.now,
+          quota: opts.quota,
+          archive: opts.archive,
+          transient: opts.transient,
+        }),
+        maxTopicRange: capsInitial(e.caps?.topicLogRange),
+        maxAddressRange: capsInitial(e.caps?.addressLogRange),
+      };
+    });
     this.entryByUrl = new Map(this.entries.map((e) => [e.url, e]));
     // limiter 侧 Retry-After 边带 → 本池对应端点 breaker（429+JSON-RPC body 丢头的对策）
     if (opts.rateLimiter) {
@@ -183,6 +192,8 @@ export class RpcPool<C> {
 
   snapshot(): Array<{
     host: string;
+    /** 匿名 key 编号（同 host 多凭据各自成行） */
+    keyId: string;
     failures: number;
     cooldownSec: number;
     maxTopicRange: bigint | null;
@@ -195,6 +206,7 @@ export class RpcPool<C> {
       const s = e.breaker.snapshot(now);
       return {
         host: hostOf(e.url),
+        keyId: e.keyId,
         failures: s.failures,
         cooldownSec: s.cooldownSec,
         maxTopicRange: e.maxTopicRange,

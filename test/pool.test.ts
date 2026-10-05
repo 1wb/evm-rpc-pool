@@ -193,6 +193,17 @@ describe("RpcPool 本地限速（rateLimiter 注入）", () => {
   });
 });
 
+describe("RpcPool.snapshot keyId", () => {
+  it("同 host 双条目按构造序 k1/k2；不同 host 各自从 k1 起计", () => {
+    const pool = new RpcPool<string>([
+      { url: "https://lb.drpc.live/a", client: "a" },
+      { url: "https://x.example/rpc", client: "x" },
+      { url: "https://lb.drpc.live/b", client: "b" },
+    ]);
+    expect(pool.snapshot().map((s) => s.keyId)).toEqual(["lb.drpc.live#k1", "x.example#k1", "lb.drpc.live#k2"]);
+  });
+});
+
 const URL_C = "https://c.example/rpc";
 
 describe("RpcPool.call selection=rotation", () => {
