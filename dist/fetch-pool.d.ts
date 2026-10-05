@@ -3,6 +3,10 @@ export interface RpcResponse {
     ok: boolean;
     status: number;
     json(): Promise<unknown>;
+    /** Retry-After 提取用；假实现可缺省 */
+    headers?: {
+        get(name: string): string | null;
+    };
 }
 export type FetchLike = (url: string, init: {
     method: string;
@@ -29,6 +33,7 @@ export declare class FetchRpcPool {
     }): Promise<T[]>;
     snapshot(): {
         host: string;
+        keyId: string;
         failures: number;
         cooldownSec: number;
         maxTopicRange: bigint | null;

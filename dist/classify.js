@@ -2,15 +2,35 @@
 export class RpcKindError extends Error {
     kind;
     rangeLimit;
-    constructor(kind, message, rangeLimit = null) {
+    retryAfterMs;
+    constructor(kind, message, rangeLimit = null, 
+    /** Retry-After 毫秒（调用方从响应头解析后携带）；冷却直取不进阶梯 */
+    retryAfterMs = null) {
         super(message);
         this.kind = kind;
         this.rangeLimit = rangeLimit;
+        this.retryAfterMs = retryAfterMs;
         this.name = "RpcKindError";
     }
 }
+/**
+ * 解析 Retry-After 头：秒数与 HTTP-date 双格式，返回距 nowMs 的毫秒。
+ * 无效/负数/非有限值回退 null（调用方走分型阶梯）。
+ */
+export function parseRetryAfter(value, nowMs) {
+    if (value === null || value.trim() === "")
+        return null;
+    const secs = Number(value);
+    if (Number.isFinite(secs)) {
+        return secs > 0 ? Math.round(secs * 1000) : null;
+    }
+    const at = Date.parse(value);
+    return Number.isFinite(at) && at > nowMs ? at - nowMs : null;
+}
+// v0.4.0 分型拆分：rate = 短时限流（429/限速文案，30s×2 短梯）；quota = 硬额度（402/额度耗尽，2min×4 长梯）
+export const RATE_TEXT = /\b429\b|too many requests|rate[ -]?(?:limit|exceeded)|request rate/i;
 // quota 正则取两父实现的并集（flower: monthly；bn-alpha: upgrade here）
-export const QUOTA_TEXT = /\b(?:402|429)\b|too many requests|rate[ -]?(?:limit|exceeded)|request rate|usage limit|quota|credits?\s*[\s\S]*(?:limit|exhaust)|current plan|monthly|upgrade here/i;
+export const QUOTA_TEXT = /\b(?:402|403)\b|usage limit|quota|credits?\s*[\s\S]*(?:limit|exhaust)|current plan|monthly|upgrade here/i;
 export const ARCHIVE_TEXT = /archive requests?|archive node|historical (?:data|state)|personal token/i;
 const REVERT_TEXT = /execution reverted/i;
 const RANGE_LIMIT_PATTERNS = [
@@ -48,6 +68,8 @@ export function classifyRpcError(error) {
         return "range";
     if (REVERT_TEXT.test(msg))
         return "reverted";
+    if (RATE_TEXT.test(msg))
+        return "rate";
     if (QUOTA_TEXT.test(msg))
         return "quota";
     if (ARCHIVE_TEXT.test(msg))

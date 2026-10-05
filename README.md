@@ -10,8 +10,8 @@ Runs on Node ≥18, Bun, and Cloudflare Workers.
 ## Install / 安装（git 依赖）
 
 ```bash
-pnpm add github:1wb/evm-rpc-pool#v0.2.0
-# 或 npm i github:1wb/evm-rpc-pool#v0.2.0
+pnpm add github:1wb/evm-rpc-pool#v0.4.0
+# 或 npm i github:1wb/evm-rpc-pool#v0.4.0
 ```
 
 ## Usage
@@ -47,10 +47,46 @@ const logs = await pool.callLogs(range, (client, r) => client.getLogs({ ...r }))
 import { EndpointBreaker, classifyRpcError } from "evm-rpc-pool";
 ```
 
+### 限速与计量（v0.4.0：同凭据跨池令牌桶 + 用量台账）
+
+```ts
+import { KeyRateLimiter, meteredFetch, PoolMeter, RpcPool } from "evm-rpc-pool";
+import { http, createPublicClient } from "viem";
+
+const limiter = new KeyRateLimiter({ acquireWaitMs: 15_000 });
+const meter = new PoolMeter();
+// 启动预登记全部 URL（稳定 host#kN 别名）；budget 相同 = 共享限额组（同 key 跨链/跨协议共用一桶）
+limiter.registerEndpoints([
+  { url: "https://lb.drpc.live/bsc", budget: "drpc-key1", reqPerMin: 90 },
+  { url: "https://lb.drpc.live/base", budget: "drpc-key1", reqPerMin: 90 },
+]);
+meter.registerEndpoints(["https://lb.drpc.live/bsc", "https://lb.drpc.live/base"]);
+
+// fetchFn = 权威扣费点（每次真实 HTTP 发送前 acquireAndWait，覆盖拆片与内部重试）；
+// retryCount: 0 —— 本地节流（LocalThrottleError）不许 viem 再重试
+const fetchFn = meteredFetch(meter, limiter);
+const client = createPublicClient({ transport: http(url, { fetchFn, retryCount: 0 }) });
+const pool = new RpcPool(entries, { rateLimiter: limiter });
+
+// 用量摘要（窗口增量，推送成功后 confirmDelta 推进水位）
+const delta = meter.snapshotDelta();
+// ... 渲染/发送 ...
+meter.confirmDelta();
+```
+
+- `meteredFetch` 对 429 读 `Retry-After` 调 `limiter.setPenalty`，经监听同步各池 breaker
+  （对策：429 + JSON-RPC error body 时 viem 包装会丢响应头）。
+- 全部候选被本地限速时抛 `PoolThrottledError`（ETA = 逐候选 max(冷却, 令牌恢复) 后取 min）；
+  语义是「本地等待」而非供应商故障——调用方宜静默延期，不计失败不告警。
+- 未登记 URL 一律放行（漏登记不致不可用）；`req_per_min: 0` = 不限。
+
 ## Semantics / 语义
 
-- 错误分型与默认冷却：`quota`（HTTP 429/402/403 或限速文案）2min×4ⁿ 封顶 6h；`archive` 30min×2ⁿ 封顶 6h；`transient`（网络/超时/5xx/非 JSON）30s×2ⁿ 封顶 10min；`reverted`/`rejected` 端点健康仅滑下家；`range` 端点内自适应拆分（下限 2000 块）。
-- 全部端点冷却时抛 `PoolCoolingError`（含 `retryAfterMs`）。
+- 错误分型与默认冷却：`quota`（HTTP 402/403 或额度耗尽文案）2min×4ⁿ 封顶 6h；`rate`（HTTP 429 或限速文案）30s×2ⁿ 封顶 10min；`archive` 30min×2ⁿ 封顶 6h；`transient`（网络/超时/5xx/非 JSON）30s×2ⁿ 封顶 10min；`reverted`/`rejected` 端点健康仅滑下家；`range` 端点内自适应拆分（下限 2000 块）。
+- 429 响应带 `Retry-After`（秒数或 HTTP-date）时直取为冷却截止（≥5s，边带取 max）；
+  冷却统一为绝对截止时间规则，重复设置取更晚，过期自然失效。
+- 全部端点冷却时抛 `PoolCoolingError`（含 `retryAfterMs`）；全部候选本地限速时抛
+  `PoolThrottledError`（含 ETA，静默延期语义）。
 - **已知语义**：回调/响应返回 `null` 视同端点故障（transient）。对合法返回 `null` 的方法
   （如 `eth_getBlockByNumber` 查不存在块）请自行包 sentinel，否则会冤枉健康端点。
 - **已知语义**：`reverted` 判定依赖错误文案（匹配 `/execution reverted/i`），不解析 revert

@@ -1,7 +1,8 @@
 import { RpcPool } from "./pool.js";
-import { ARCHIVE_TEXT, QUOTA_TEXT, RpcKindError, isContractRevertMessage, isRangeLimitMessage, rangeLimitFromMessage, } from "./classify.js";
+import { ARCHIVE_TEXT, QUOTA_TEXT, RpcKindError, isContractRevertMessage, isRangeLimitMessage, parseRetryAfter, rangeLimitFromMessage, } from "./classify.js";
 import { hostOf } from "./url.js";
-const QUOTA_STATUS = new Set([429, 402, 403]);
+const RATE_STATUS = new Set([429]);
+const QUOTA_STATUS = new Set([402, 403]);
 const DEFAULT_TIMEOUT_MS = 20_000;
 function timeoutSignal(ms) {
     const t = AbortSignal.timeout;
@@ -20,6 +21,10 @@ async function attemptJsonRpc(c, method, params) {
     }
     catch (err) {
         throw new RpcKindError("transient", String(err).slice(0, 120));
+    }
+    if (RATE_STATUS.has(res.status)) {
+        const retryAfterMs = parseRetryAfter(res.headers?.get("retry-after") ?? null, Date.now());
+        throw new RpcKindError("rate", `HTTP ${res.status}`, null, retryAfterMs);
     }
     if (QUOTA_STATUS.has(res.status))
         throw new RpcKindError("quota", `HTTP ${res.status}`);
