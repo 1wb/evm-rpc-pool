@@ -1,4 +1,4 @@
-import { RpcPool, type EntryCaps, type RpcPoolOptions } from "./pool.js";
+import { RpcPool, type EntryCaps, type LogLane, type RpcPoolOptions } from "./pool.js";
 import {
   ARCHIVE_TEXT,
   QUOTA_TEXT,
@@ -31,7 +31,22 @@ export interface FetchRpcPoolOptions extends RpcPoolOptions {
   timeoutMs?: number;
   /** host → 能力表（如 { "base-rpc.publicnode.com": { topicLogs: false } }） */
   hostCaps?: Record<string, EntryCaps>;
+  /** 可空方法白名单（方法名集合）：命中方法返回合法 null 视为成功不冷却；
+   *  传入时整体替换默认白名单，缺省用 DEFAULT_NULLABLE_METHODS（spec §5.4）。 */
+  nullableMethods?: Iterable<string>;
 }
+
+/** 默认可空方法白名单：合法业务语义允许返回 null 的查询方法（spec §5.4）。
+ *  注：eth_getBlockByNumber / eth_getBlockByHash 有意不在名单内——请求已知区块
+ *  命中同步滞后节点返回 null 时须继续按 transient 滑向健康节点。 */
+export const DEFAULT_NULLABLE_METHODS: ReadonlySet<string> = new Set([
+  "eth_getTransactionReceipt",
+  "eth_getTransactionByHash",
+  "eth_getTransactionByBlockHashAndIndex",
+  "eth_getTransactionByBlockNumberAndIndex",
+  "eth_getUncleByBlockHashAndIndex",
+  "eth_getUncleByBlockNumberAndIndex",
+]);
 
 const RATE_STATUS = new Set([429]);
 const QUOTA_STATUS = new Set([402, 403]);
@@ -48,8 +63,10 @@ interface FetchClient {
   timeoutMs: number;
 }
 
-/** 把 fetch / HTTP 状态 / JSON-RPC error 三层结果映射为预分型错误；rejected 只可能出自这里。 */
-async function attemptJsonRpc(c: FetchClient, method: string, params: unknown): Promise<unknown> {
+/** 把 fetch / HTTP 状态 / JSON-RPC error 三层结果映射为预分型错误；rejected 只可能出自这里。
+ *  allowNull：方法命中可空白名单（或单次显式放行）时，合法 `result: null` 视为成功原样返回；
+ *  缺失 result 键的畸形响应（j.result === undefined）恒按 transient 滑下家（Review Focus #4）。 */
+async function attemptJsonRpc(c: FetchClient, method: string, params: unknown, allowNull: boolean): Promise<unknown> {
   let res: RpcResponse;
   try {
     res = await c.fetch(c.url, {
@@ -89,12 +106,34 @@ async function attemptJsonRpc(c: FetchClient, method: string, params: unknown): 
     if (ARCHIVE_TEXT.test(msg)) throw new RpcKindError("archive", short);
     throw new RpcKindError("rejected", short);
   }
-  if (j && j.result !== undefined && j.result !== null) return j.result;
+  if (j && j.result !== undefined) {
+    if (j.result !== null || allowNull) return j.result;
+  }
   throw new RpcKindError("transient", "null result");
+}
+
+/** getLogs topics 过滤项：单值、位置内嵌套数组 OR（如 [[t0, t1]]）或 null 通配位。 */
+export type TopicFilter = ReadonlyArray<string | readonly string[] | null>;
+
+export interface GetLogsOptions {
+  /** 可选：缺省、空串 "" 或空数组 [] 时省略 JSON-RPC filter 中的 address 字段；支持单地址或地址数组 OR */
+  address?: string | readonly string[];
+  /** 可选：undefined 时省略 topics 字段，显式传 [] 时原样保留 topics: [] */
+  topics?: TopicFilter;
+  fromBlock: number | bigint;
+  toBlock: number | bigint;
+  /** 可选显式指定分桶通道；缺省按 topics 自动派生（存在有效过滤项走 "topic"，否则走 "address"） */
+  lane?: LogLane;
+}
+
+/** topics 形状 → lane 自动派生（spec §5.5）：存在至少一个有效过滤项（非空单值或非空嵌套数组）走 topic。 */
+function deriveLane(topics: TopicFilter | undefined): LogLane {
+  return (topics ?? []).some((t) => typeof t === "string" || (Array.isArray(t) && t.length > 0)) ? "topic" : "address";
 }
 
 export class FetchRpcPool {
   private readonly pool: RpcPool<FetchClient>;
+  private readonly nullableMethods: ReadonlySet<string>;
 
   constructor(urls: string[], opts: FetchRpcPoolOptions = {}) {
     if (!urls.length) throw new Error("FetchRpcPool: 端点列表为空");
@@ -106,32 +145,31 @@ export class FetchRpcPool {
       client: { url, fetch: opts.fetchImpl ?? fallback, timeoutMs } satisfies FetchClient,
       caps: opts.hostCaps?.[hostOf(url)],
     }));
+    this.nullableMethods = opts.nullableMethods !== undefined ? new Set(opts.nullableMethods) : DEFAULT_NULLABLE_METHODS;
     this.pool = new RpcPool<FetchClient>(entries, opts);
   }
 
-  call<T>(method: string, params: unknown): Promise<T> {
-    return this.pool.call((c) => attemptJsonRpc(c, method, params) as Promise<T>);
+  call<T>(method: string, params: unknown, opts?: { allowNull?: boolean }): Promise<T> {
+    const allowNull = opts?.allowNull ?? this.nullableMethods.has(method);
+    return this.pool.call((c) => attemptJsonRpc(c, method, params, allowNull) as Promise<T>, { allowNull });
   }
 
-  /** fromBlock/toBlock 接受 number 或 bigint（number 侧为历史消费方便利），内部统一 bigint。 */
-  getLogs<T>(opts: {
-    address: string;
-    topics: string[];
-    fromBlock: number | bigint;
-    toBlock: number | bigint;
-  }): Promise<T[]> {
+  /** fromBlock/toBlock 接受 number 或 bigint（number 侧为历史消费方便利），内部统一 bigint。
+   *  出站 filter 构造（spec §5.5）：address 缺省/空串/空数组时省略该键；topics 仅 undefined
+   *  时省略（显式 [] 原样保留）；lane 显式优先，缺省按 topics 形状自动派生。 */
+  getLogs<T>(opts: GetLogsOptions): Promise<T[]> {
     const range: BlockRange = { fromBlock: BigInt(opts.fromBlock), toBlock: BigInt(opts.toBlock) };
-    // 按 topics 形状自动派生 lane：存在非 null topic 走 topic 通道（null 占位不算），否则 address 通道
-    const lane: "topic" | "address" = opts.topics.some((t) => t != null) ? "topic" : "address";
+    const lane: LogLane = opts.lane ?? deriveLane(opts.topics);
     return this.pool.callLogs<T>(range, async (c, r) => {
-      const result = (await attemptJsonRpc(c, "eth_getLogs", [
-        {
-          address: opts.address,
-          topics: opts.topics,
-          fromBlock: "0x" + r.fromBlock.toString(16),
-          toBlock: "0x" + r.toBlock.toString(16),
-        },
-      ])) as T[];
+      const filter: Record<string, unknown> = {
+        fromBlock: "0x" + r.fromBlock.toString(16),
+        toBlock: "0x" + r.toBlock.toString(16),
+      };
+      const hasAddress =
+        typeof opts.address === "string" ? opts.address.length > 0 : Array.isArray(opts.address) && opts.address.length > 0;
+      if (hasAddress) filter.address = opts.address;
+      if (opts.topics !== undefined) filter.topics = opts.topics;
+      const result = (await attemptJsonRpc(c, "eth_getLogs", [filter], false)) as T[];
       return Array.isArray(result) ? result : [];
     }, { lane });
   }

@@ -157,9 +157,10 @@ export class RpcPool<C> {
    * rejected/reverted 滑下家不冷却，quota/archive/transient 冷却后滑下家，ok 清零。
    * 注入 rateLimiter 时无令牌候选直接跳过；存在本地受限候选时（无论是否混入其他失败）
    * 统一抛 PoolThrottledError（静默延期语义，spec §5.3）。
-   * 回调返回 null/undefined 视同 transient（对合法返回 null 的方法请自行包 sentinel）。
+   * 回调返回 undefined 恒视同 transient；返回 null 默认同 transient，
+   * opts.allowNull === true 时视为成功（report("ok") 并原样返回 null，spec §5.4）。
    */
-  async call<T>(fn: (client: C, url: string) => Promise<T>): Promise<T> {
+  async call<T>(fn: (client: C, url: string) => Promise<T>, opts?: { allowNull?: boolean }): Promise<T> {
     const candidates = this.ordered(this.entries);
     const reasons: string[] = [];
     const throttleUntil = new Map<string, number>();
@@ -178,7 +179,7 @@ export class RpcPool<C> {
       attempts += 1;
       try {
         const result = await fn(e.client, e.url);
-        if (result === null || result === undefined) {
+        if (result === undefined || (result === null && !opts?.allowNull)) {
           reasons.push(this.fail(e, new Error("返回 null")));
           coolingEntries.push(e);
           continue;

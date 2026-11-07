@@ -317,3 +317,65 @@ describe("FetchRpcPool 工厂", () => {
     expect(() => new FetchRpcPool([], { fetchImpl: async () => ok("x") })).toThrow();
   });
 });
+
+// ---------- 可空 JSON-RPC 方法（spec §5.4） ----------
+
+describe("FetchRpcPool 可空方法", () => {
+  it("默认可空方法（eth_getTransactionReceipt / eth_getTransactionByHash）返回 null 不冷却且直接返回 null", async () => {
+    const { fn, calls } = makeFetch({ [URL_A]: () => ok(null), [URL_B]: () => ok("B") });
+    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn });
+    expect(await pool.call("eth_getTransactionReceipt", ["0xdead"])).toBeNull();
+    expect(await pool.call("eth_getTransactionByHash", ["0xdead"])).toBeNull();
+    expect(calls).toHaveLength(2); // 未滑到 URL_B
+    expect(pool.snapshot()[0]).toMatchObject({ failures: 0, cooldownSec: 0 });
+  });
+
+  it("可空方法遇到缺失 result 键的畸形响应 {} 仍按 transient 滑下家（Review Focus #4）", async () => {
+    const { fn } = makeFetch({
+      [URL_A]: () => ({ ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1 }) }),
+      [URL_B]: () => ok(null),
+    });
+    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn });
+    expect(await pool.call("eth_getTransactionReceipt", ["0xdead"])).toBeNull();
+    expect(pool.snapshot()[0].failures).toBe(1); // URL_A 缺 result 记故障
+    expect(pool.snapshot()[1].failures).toBe(0); // URL_B 返回合法 null 成功
+  });
+
+  it("nullableMethods 构造覆盖与单次 call({ allowNull }) 优先级生效", async () => {
+    const { fn } = makeFetch({ [URL_A]: () => ok(null), [URL_B]: () => ok("B") });
+    // 构造覆盖：白名单清空 → null 不放行，按 transient 滑下家
+    const strictPool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, nullableMethods: [] });
+    expect(await strictPool.call("eth_getTransactionReceipt", ["0xdead"])).toBe("B");
+    // 单次优先级：fresh pool（同样空白名单）上显式 allowNull 仍单次放行 null
+    // （同池连断言会因首断言的 transient 冷却跳过 URL_A，无法到达放行路径）
+    const perCallPool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, nullableMethods: [] });
+    expect(await perCallPool.call("eth_getBlockByNumber", ["0x1", false], { allowNull: true })).toBeNull();
+  });
+});
+
+// ---------- getLogs 过滤与通道升级（spec §5.5） ----------
+
+describe("FetchRpcPool.getLogs 过滤与通道升级", () => {
+  it("getLogs 支持省略/空串/空数组 address、地址数组 OR、嵌套 topics OR 及显式 lane 覆盖", async () => {
+    const { fn, calls } = makeFetch({
+      [URL_NODE]: () => ok([{ n: 1 }]),
+      [URL_A]: () => ok([{ a: 1 }]),
+    });
+    const pool = new FetchRpcPool([URL_NODE, URL_A], {
+      fetchImpl: fn,
+      hostCaps: { "base-rpc.publicnode.com": { topicLogRange: 0, addressLogRange: 1000 } },
+    });
+    // 1. 纯 topic 流（空串 address → 出站省略 address 键，走 topic lane → 跳过 URL_NODE 落 URL_A）
+    await pool.getLogs({ address: "", topics: [["0xt0", "0xt1"]], fromBlock: 1, toBlock: 10 });
+    const f1 = (calls[0].body.params as [Record<string, unknown>])[0];
+    expect("address" in f1).toBe(false);
+    expect(f1.topics).toEqual([["0xt0", "0xt1"]]);
+    expect(calls[0].url).toBe(URL_A);
+
+    // 2. 多地址 + 嵌套 topics + 显式 lane="address" → 命中 URL_NODE(addressLogRange=1000)
+    await pool.getLogs({ address: ["0xp1", "0xp2"], topics: [["0xt0"]], fromBlock: 1, toBlock: 10, lane: "address" });
+    const f2 = (calls[1].body.params as [Record<string, unknown>])[0];
+    expect(f2.address).toEqual(["0xp1", "0xp2"]);
+    expect(calls[1].url).toBe(URL_NODE);
+  });
+});

@@ -314,3 +314,13 @@ describe("RpcPool.call selection=priority (默认语义锁定)", () => {
     expect(seen).toEqual(["A", "A", "A"]);
   });
 });
+
+describe("RpcPool.call allowNull", () => {
+  it("RpcPool.call({ allowNull: true }) 放行 null 且不记失败，但 undefined 仍按 transient 失败", async () => {
+    const pool = twoPool();
+    expect(await pool.call(async () => null, { allowNull: true })).toBeNull();
+    expect(pool.snapshot()[0]).toMatchObject({ failures: 0, cooldownSec: 0 });
+    expect(await pool.call(async (c) => (c === "A" ? undefined : c), { allowNull: true })).toBe("B");
+    expect(pool.snapshot()[0].failures).toBe(1);
+  });
+});
