@@ -319,6 +319,10 @@ describe("FetchRpcPool 工厂", () => {
   it("空 urls 构造即抛错", () => {
     expect(() => new FetchRpcPool([], { fetchImpl: async () => ok("x") })).toThrow();
   });
+
+  it("minChunk: 0 构造即抛错（底层 RpcPool 校验的工厂层显式覆盖）", () => {
+    expect(() => new FetchRpcPool([URL_A], { minChunk: 0 })).toThrow(/minChunk/);
+  });
 });
 
 // ---------- 可空 JSON-RPC 方法（spec §5.4） ----------
@@ -380,5 +384,11 @@ describe("FetchRpcPool.getLogs 过滤与通道升级", () => {
     const f2 = (calls[1].body.params as [Record<string, unknown>])[0];
     expect(f2.address).toEqual(["0xp1", "0xp2"]);
     expect(calls[1].url).toBe(URL_NODE);
+
+    // 3. 空数组 address：与空串同语义，出站 filter 省略 address 键
+    await pool.getLogs({ address: [], topics: [["0xt0"]], fromBlock: 1, toBlock: 10 });
+    const f3 = (calls[2].body.params as [Record<string, unknown>])[0];
+    expect("address" in f3).toBe(false);
+    expect(calls[2].url).toBe(URL_A);
   });
 });

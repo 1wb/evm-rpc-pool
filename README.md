@@ -83,7 +83,7 @@ meter.confirmDelta();
 ### 可空方法、getLogs 过滤器与节流工具（v0.5.0）
 
 ```ts
-import { BreakerRegistry, FetchRpcPool, isThrottleError, throttleRetryAfterMs } from "evm-rpc-pool";
+import { FetchRpcPool, isThrottleError, throttleRetryAfterMs } from "evm-rpc-pool";
 
 // 可空 JSON-RPC 方法：pending 交易/回执查询合法返回 null，不再冤枉端点
 // DEFAULT_NULLABLE_METHODS（查交易/回执/叔块）默认放行；eth_getBlockByNumber 有意不在白名单
