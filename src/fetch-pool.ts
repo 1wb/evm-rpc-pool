@@ -2,6 +2,7 @@ import { RpcPool, type EntryCaps, type RpcPoolOptions } from "./pool.js";
 import {
   ARCHIVE_TEXT,
   QUOTA_TEXT,
+  RATE_TEXT,
   RpcKindError,
   isContractRevertMessage,
   isRangeLimitMessage,
@@ -9,6 +10,7 @@ import {
   rangeLimitFromMessage,
 } from "./classify.js";
 import type { BlockRange } from "./range.js";
+import { isThrottleError } from "./throttle.js";
 import { hostOf } from "./url.js";
 
 export interface RpcResponse {
@@ -57,7 +59,9 @@ async function attemptJsonRpc(c: FetchClient, method: string, params: unknown): 
       signal: timeoutSignal(c.timeoutMs),
     });
   } catch (err) {
-    throw new RpcKindError("transient", String(err).slice(0, 120));
+    // 本地节流（含包装形态）原样透传：pool 层按节流归并静默延期，不计失败不冷却
+    if (isThrottleError(err)) throw err;
+    throw new RpcKindError("transient", String(err).slice(0, 120), null, null, { cause: err });
   }
   if (RATE_STATUS.has(res.status)) {
     const retryAfterMs = parseRetryAfter(res.headers?.get("retry-after") ?? null, Date.now());
@@ -77,10 +81,12 @@ async function attemptJsonRpc(c: FetchClient, method: string, params: unknown): 
         ? String((j.error as { message?: unknown }).message ?? j.error)
         : String(j.error);
     const short = msg.slice(0, 120);
-    if (QUOTA_TEXT.test(msg)) throw new RpcKindError("quota", short);
-    if (ARCHIVE_TEXT.test(msg)) throw new RpcKindError("archive", short);
+    // 判定序与 classifyRpcError 锁定一致：range → reverted → quota → rate → archive → rejected
     if (isRangeLimitMessage(msg)) throw new RpcKindError("range", short, rangeLimitFromMessage(msg));
     if (isContractRevertMessage(msg)) throw new RpcKindError("reverted", short);
+    if (QUOTA_TEXT.test(msg)) throw new RpcKindError("quota", short);
+    if (RATE_TEXT.test(msg)) throw new RpcKindError("rate", short);
+    if (ARCHIVE_TEXT.test(msg)) throw new RpcKindError("archive", short);
     throw new RpcKindError("rejected", short);
   }
   if (j && j.result !== undefined && j.result !== null) return j.result;

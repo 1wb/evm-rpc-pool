@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { FetchRpcPool, type FetchLike, type RpcResponse } from "../src/fetch-pool";
-import { PoolCoolingError } from "../src/pool";
+import { PoolCoolingError, PoolThrottledError } from "../src/pool";
+import { LocalThrottleError } from "../src/limiter";
 
 // ---------- 假 fetch + 假时钟 ----------
 
@@ -147,6 +148,27 @@ describe("FetchRpcPool.call", () => {
     const err = await pool.call("eth_blockNumber", []).catch((e) => e);
     expect(err).toBeInstanceOf(PoolCoolingError);
   });
+
+  it("200 + JSON-RPC rate limit 文案 → rate 短梯 30s（不再落入不冷却的 rejected）", async () => {
+    const clock = makeClock();
+    const { fn } = makeFetch({
+      [URL_A]: () => rpcError("rate limit exceeded"),
+      [URL_B]: () => ok("B"),
+    });
+    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, now: clock.now });
+    expect(await pool.call<string>("eth_blockNumber", [])).toBe("B");
+    expect(pool.snapshot()[0]).toMatchObject({ failures: 1, cooldownSec: 30 });
+  });
+
+  it("fetchImpl 抛 LocalThrottleError（含包装 cause）时原样透传为 PoolThrottledError，端点零冷却", async () => {
+    const pool = new FetchRpcPool([URL_A], {
+      fetchImpl: async () => { throw new Error("wrapped", { cause: new LocalThrottleError(2500) }); },
+    });
+    const err = await pool.call("eth_blockNumber", []).catch((e) => e);
+    expect(err).toBeInstanceOf(PoolThrottledError);
+    expect((err as PoolThrottledError).retryAfterMs).toBe(2500);
+    expect(pool.snapshot()[0]).toMatchObject({ failures: 0, cooldownSec: 0 });
+  });
 });
 
 // ---------- getLogs ----------
@@ -220,6 +242,23 @@ describe("FetchRpcPool.getLogs", () => {
     const filter = (calls[0].body.params as [Record<string, string>])[0];
     expect(filter.fromBlock).toBe("0xff");
     expect(filter.toBlock).toBe("0x100");
+  });
+
+  it("200 + free plan rate limit → quota 长梯 120s；带 upgrade here 尾巴的 range 文案 → 拆片不冷却", async () => {
+    const clock = makeClock();
+    const { fn } = makeFetch({
+      [URL_A]: () => rpcError("You reached free plan rate limit"),
+      [URL_B]: (body) => {
+        const { from, to } = getLogsParams(body);
+        if (to - from + 1 > 10) return rpcError("Under your current plan, up to 10 blocks allowed. Upgrade here");
+        return ok([{ ok: true }]);
+      },
+    });
+    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, now: clock.now });
+    const logs = await pool.getLogs<{ ok: boolean }>({ address: "0xp", topics: ["0xt"], fromBlock: 0, toBlock: 29 });
+    expect(logs).toHaveLength(3);
+    expect(pool.snapshot()[0]).toMatchObject({ failures: 1, cooldownSec: 120 }); // URL_A: quota
+    expect(pool.snapshot()[1]).toMatchObject({ failures: 0, cooldownSec: 0, maxTopicRange: 10n }); // URL_B: range
   });
 });
 

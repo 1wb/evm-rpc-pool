@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isLocalThrottle, KeyRateLimiter, LocalThrottleError } from "../src/limiter";
+import { isThrottleError, PoolThrottledError, throttleRetryAfterMs } from "../src/index";
 
 const URL_A = "https://a.example/rpc";
 const URL_B = "https://b.example/rpc";
@@ -143,5 +144,27 @@ describe("isLocalThrottle cause 链识别", () => {
     expect(isLocalThrottle(new Error("x", { cause: new Error("y") }))).toBe(false);
     expect(isLocalThrottle(undefined)).toBe(false);
     expect(isLocalThrottle("boom")).toBe(false);
+  });
+});
+
+describe("isThrottleError & throttleRetryAfterMs", () => {
+  it("同时识别顶层与深层 cause 链的 LocalThrottleError 与 PoolThrottledError（含 name 兜底）", () => {
+    expect(isThrottleError(new LocalThrottleError(1200))).toBe(true);
+    expect(isThrottleError(new PoolThrottledError(3400))).toBe(true);
+    expect(throttleRetryAfterMs(new Error("viem wrap", { cause: new PoolThrottledError(3400) }))).toBe(3400);
+    expect(throttleRetryAfterMs(new Error("viem wrap", { cause: new LocalThrottleError(1200) }))).toBe(1200);
+    const crossRealm = Object.assign(new Error("throttled"), { name: "PoolThrottledError", retryAfterMs: 2500 });
+    expect(isThrottleError(crossRealm)).toBe(true);
+    expect(throttleRetryAfterMs(crossRealm)).toBe(2500);
+  });
+
+  it("循环引用 cause 链与非对象原始值在 10 层内安全返回 false / null", () => {
+    const a = new Error("a");
+    const b = new Error("b", { cause: a });
+    a.cause = b;
+    expect(isThrottleError(a)).toBe(false);
+    expect(throttleRetryAfterMs(a)).toBeNull();
+    expect(isThrottleError(null)).toBe(false);
+    expect(throttleRetryAfterMs(42)).toBeNull();
   });
 });

@@ -1,10 +1,14 @@
 import { EndpointBreaker, type BreakerTuning, type CoolingKind } from "./endpoint-breaker.js";
 import { classifyRpcError, RpcKindError, type RpcErrorKind } from "./classify.js";
 import { rangeLimitFromMessage } from "./classify.js";
-import { isLocalThrottle, KeyRateLimiter, localThrottleRetryAfterMs } from "./limiter.js";
+import { KeyRateLimiter } from "./limiter.js";
 import { MIN_CHUNK, splitBlockRange, type BlockRange } from "./range.js";
 import { redactError, redactUrl } from "./redact.js";
+import { isThrottleError, PoolThrottledError, throttleRetryAfterMs } from "./throttle.js";
 import { hostOf } from "./url.js";
+
+/** 从独立共享模块 re-export（v0.5.0 起定义移至 src/throttle.ts），保持 v0.1.x 导入路径兼容。 */
+export { PoolThrottledError };
 
 export interface EntryCaps {
   /** 是否支持按 topic 过滤的 getLogs（false = topic 候选中跳过该端点） */
@@ -48,17 +52,6 @@ export class PoolCoolingError extends Error {
     super(`全部 RPC 端点均在冷却，最早 ${Math.ceil(retryAfterMs / 1000)} 秒后可重试：${labels.join("、")}`);
     this.name = "PoolCoolingError";
     this.retryAfterMs = retryAfterMs;
-  }
-}
-
-/** 全部候选被本地令牌桶限住（非供应商故障）时抛出；调用方静默延期，不计失败不告警。
- *  ETA = 逐候选 max(冷却到期, 令牌恢复, 已观察节流截止) 后取 min。 */
-export class PoolThrottledError extends Error {
-  readonly retryAfterMs: number;
-  constructor(retryAfterMs: number) {
-    super(`本地限速：全部候选受限，最早 ${Math.ceil(retryAfterMs / 1000)} 秒后可重试`);
-    this.name = "PoolThrottledError";
-    this.retryAfterMs = Math.max(0, retryAfterMs);
   }
 }
 
@@ -190,11 +183,11 @@ export class RpcPool<C> {
         e.breaker.report("ok");
         return result;
       } catch (error) {
-        const throttled = isLocalThrottle(error);
+        const throttled = isThrottleError(error);
         reasons.push(this.fail(e, error));
         if (throttled) {
           sawThrottle = true;
-          const ms = localThrottleRetryAfterMs(error);
+          const ms = throttleRetryAfterMs(error);
           if (ms !== null) throttleUntil.set(e.url, Math.max(throttleUntil.get(e.url) ?? 0, this.now() + ms));
         } else {
           sawOther = true;
@@ -280,11 +273,11 @@ export class RpcPool<C> {
         e.breaker.report("ok");
         return out;
       } catch (error) {
-        const throttled = isLocalThrottle(error);
+        const throttled = isThrottleError(error);
         reasons.push(this.fail(e, error));
         if (throttled) {
           sawThrottle = true;
-          const ms = localThrottleRetryAfterMs(error);
+          const ms = throttleRetryAfterMs(error);
           if (ms !== null) throttleUntil.set(e.url, Math.max(throttleUntil.get(e.url) ?? 0, this.now() + ms));
         } else {
           sawOther = true;
@@ -338,7 +331,7 @@ export class RpcPool<C> {
 
   /** 按分型处置单端点失败，返回脱敏原因供聚合报错。 */
   private fail(e: EntryState<C>, error: unknown): string {
-    if (isLocalThrottle(error)) {
+    if (isThrottleError(error)) {
       // 本地令牌桶节流非供应商故障：不计失败不冷却，仅终止在途探针
       e.breaker.slide();
       return `${hostOf(e.url)}: 本地限速`;

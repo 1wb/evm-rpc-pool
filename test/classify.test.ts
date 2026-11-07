@@ -57,6 +57,20 @@ describe("classifyRpcError", () => {
     expect(e.kind).toBe("rejected");
     expect(e.rangeLimit).toBeNull();
   });
+  it("range 优先于套餐尾巴文案（Alchemy/QuickNode 免费档块跨度提示不误判 quota）", () => {
+    const msg = "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range. Upgrade here";
+    expect(classifyRpcError(new Error(msg))).toBe("range");
+    expect(rangeLimitFromMessage(msg)).toBe(10n);
+  });
+  it("quota 优先于 rate：free plan rate limit / plan limit 归入硬额度长梯", () => {
+    expect(classifyRpcError(new Error("You reached free plan rate limit, please upgrade"))).toBe("quota");
+    expect(classifyRpcError(new Error("plan limit exceeded"))).toBe("quota");
+  });
+  it("RpcKindError 支持透传 options.cause", () => {
+    const root = new Error("ECONNRESET");
+    const e = new RpcKindError("transient", "network fail", null, null, { cause: root });
+    expect(e.cause).toBe(root);
+  });
 });
 
 describe("parseRetryAfter", () => {
