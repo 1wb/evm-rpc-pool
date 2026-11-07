@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PoolCoolingError, PoolThrottledError, RpcPool, type RpcPoolOptions } from "../src/pool";
 import { RpcKindError } from "../src/classify";
+import { BreakerRegistry } from "../src/endpoint-breaker";
 import { KeyRateLimiter, LocalThrottleError } from "../src/limiter";
 
 const URL_A = "https://a.example/rpc";
@@ -322,5 +323,22 @@ describe("RpcPool.call allowNull", () => {
     expect(pool.snapshot()[0]).toMatchObject({ failures: 0, cooldownSec: 0 });
     expect(await pool.call(async (c) => (c === "A" ? undefined : c), { allowNull: true })).toBe("B");
     expect(pool.snapshot()[0].failures).toBe(1);
+  });
+});
+
+describe("RpcPool breakerFor 注入（跨池共享熔断）", () => {
+  it("breakerFor 注入：双池共享同一 BreakerRegistry 的冷却与探针恢复状态", async () => {
+    const clock = makeClock();
+    const reg = new BreakerRegistry({ now: clock.now });
+    const p1 = twoPool({ now: clock.now, breakerFor: (u) => reg.get(u) });
+    const p2 = twoPool({ now: clock.now, breakerFor: (u) => reg.get(u) });
+    expect(await p1.call(async (c) => {
+      if (c === "A") throw new RpcKindError("rate", "HTTP 429");
+      return c;
+    })).toBe("B");
+    // p2 立即感知 URL_A 冷却，直接走 B，不重打 A
+    const seenP2: string[] = [];
+    expect(await p2.call(async (c) => { seenP2.push(c); return c; })).toBe("B");
+    expect(seenP2).toEqual(["B"]);
   });
 });

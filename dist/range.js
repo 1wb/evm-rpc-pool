@@ -1,4 +1,4 @@
-export const MIN_CHUNK = 2000n;
+export const MIN_CHUNK = 10n;
 /** 把 [from, to] 切成不超过 chunk 块的若干片（公共 RPC 有跨度上限）；from > to 返回空数组。 */
 export function splitBlockRange(from, to, chunk) {
     if (chunk < 1n)

@@ -1,4 +1,4 @@
-export declare const MIN_CHUNK = 2000n;
+export declare const MIN_CHUNK = 10n;
 export interface BlockRange {
     fromBlock: bigint;
     toBlock: bigint;

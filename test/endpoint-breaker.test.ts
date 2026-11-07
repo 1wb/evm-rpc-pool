@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EndpointBreaker } from "../src/endpoint-breaker";
+import { BreakerRegistry, EndpointBreaker } from "../src/endpoint-breaker";
 
 function makeClock() {
   let t = 1_000_000;
@@ -126,5 +126,22 @@ describe("EndpointBreaker", () => {
     const b = new EndpointBreaker({ now: clock.now, quota: { baseMs: 1000, factor: 2, capMs: 4000 } });
     b.report("quota");
     expect(b.snapshot(clock.now()).cooldownSec).toBe(1);
+  });
+});
+
+describe("BreakerRegistry", () => {
+  it("懒创建、未触碰 URL snapshot 不建实例、setPenalty 与 clear 生效", () => {
+    const clock = makeClock();
+    const reg = new BreakerRegistry({ now: clock.now });
+    expect(reg.has("https://a.example")).toBe(false);
+    expect(reg.snapshot("https://a.example")).toEqual({ failures: 0, cooldownSec: 0 });
+    expect(reg.has("https://a.example")).toBe(false); // snapshot 不脏建实例
+
+    reg.setPenalty("https://a.example", clock.now() + 20_000);
+    expect(reg.has("https://a.example")).toBe(true);
+    expect(reg.snapshot("https://a.example").cooldownSec).toBe(20);
+
+    reg.clear();
+    expect(reg.has("https://a.example")).toBe(false);
   });
 });

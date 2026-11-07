@@ -1,10 +1,13 @@
 import { EndpointBreaker } from "./endpoint-breaker.js";
 import { classifyRpcError, RpcKindError } from "./classify.js";
 import { rangeLimitFromMessage } from "./classify.js";
-import { isLocalThrottle, KeyRateLimiter, localThrottleRetryAfterMs } from "./limiter.js";
+import { KeyRateLimiter } from "./limiter.js";
 import { MIN_CHUNK, splitBlockRange } from "./range.js";
 import { redactError, redactUrl } from "./redact.js";
+import { isThrottleError, PoolThrottledError, throttleRetryAfterMs } from "./throttle.js";
 import { hostOf } from "./url.js";
+/** 从独立共享模块 re-export（v0.5.0 起定义移至 src/throttle.ts），保持 v0.1.x 导入路径兼容。 */
+export { PoolThrottledError };
 /** 全部端点均在冷却（含探针在途）时抛出，带最早可重试时间与脱敏标签。 */
 export class PoolCoolingError extends Error {
     retryAfterMs;
@@ -14,22 +17,25 @@ export class PoolCoolingError extends Error {
         this.retryAfterMs = retryAfterMs;
     }
 }
-/** 全部候选被本地令牌桶限住（非供应商故障）时抛出；调用方静默延期，不计失败不告警。
- *  ETA = 逐候选 max(冷却到期, 令牌恢复, 已观察节流截止) 后取 min。 */
-export class PoolThrottledError extends Error {
-    retryAfterMs;
-    constructor(retryAfterMs) {
-        super(`本地限速：全部候选受限，最早 ${Math.ceil(retryAfterMs / 1000)} 秒后可重试`);
-        this.name = "PoolThrottledError";
-        this.retryAfterMs = Math.max(0, retryAfterMs);
-    }
-}
 /** 端点健康但本次调用失败（rejected/reverted/range 拆到下限），滑下家不冷却。 */
 class SlideSignal extends Error {
 }
 /** caps 数值 → 初始学习值；缺省或 <=0 视同未声明（null = 无已学上限，不预分块）。 */
 function capsInitial(n) {
     return n != null && n > 0 ? BigInt(n) : null;
+}
+/** minChunk 选项 → bigint 下限；缺省取 MIN_CHUNK，非法（<1、非整数、NaN）构造即抛。 */
+function resolveMinChunk(raw) {
+    if (raw === undefined)
+        return MIN_CHUNK;
+    if (typeof raw === "bigint") {
+        if (raw < 1n)
+            throw new Error("RpcPool: minChunk 必须 >= 1");
+        return raw;
+    }
+    if (!Number.isInteger(raw) || raw < 1)
+        throw new Error("RpcPool: minChunk 必须 >= 1");
+    return BigInt(raw);
 }
 /** 数值 caps 的 lane 支持判定：缺省视为支持，<=0 视同不支持该 lane。 */
 function laneSupported(n) {
@@ -46,6 +52,7 @@ export class RpcPool {
     now;
     selection;
     rateLimiter;
+    minChunk;
     rotationIndex = 0;
     constructor(entries, opts = {}) {
         if (!entries.length)
@@ -53,6 +60,7 @@ export class RpcPool {
         this.now = opts.now ?? Date.now;
         this.selection = opts.selection ?? "priority";
         this.rateLimiter = opts.rateLimiter;
+        this.minChunk = resolveMinChunk(opts.minChunk);
         const hostSeq = new Map();
         this.entries = entries.map((e) => {
             const host = hostOf(e.url);
@@ -61,12 +69,15 @@ export class RpcPool {
             return {
                 ...e,
                 keyId: `${host}#k${seq}`,
-                breaker: new EndpointBreaker({
-                    now: opts.now,
-                    quota: opts.quota,
-                    archive: opts.archive,
-                    transient: opts.transient,
-                }),
+                breaker: opts.breakerFor
+                    ? opts.breakerFor(e.url)
+                    : new EndpointBreaker({
+                        now: opts.now,
+                        quota: opts.quota,
+                        rate: opts.rate,
+                        archive: opts.archive,
+                        transient: opts.transient,
+                    }),
                 maxTopicRange: capsInitial(e.caps?.topicLogRange),
                 maxAddressRange: capsInitial(e.caps?.addressLogRange),
             };
@@ -96,54 +107,59 @@ export class RpcPool {
     /**
      * 粘性优先通用调用：恒按构造序过滤冷却端点，从首个开始试；
      * rejected/reverted 滑下家不冷却，quota/archive/transient 冷却后滑下家，ok 清零。
-     * 注入 rateLimiter 时无令牌候选直接跳过；全部候选本地受限抛 PoolThrottledError（静默延期语义）。
-     * 回调返回 null/undefined 视同 transient（对合法返回 null 的方法请自行包 sentinel）。
+     * 注入 rateLimiter 时无令牌候选直接跳过；存在本地受限候选时（无论是否混入其他失败）
+     * 统一抛 PoolThrottledError（静默延期语义，spec §5.3）。
+     * 回调返回 undefined 恒视同 transient；返回 null 默认同 transient，
+     * opts.allowNull === true 时视为成功（report("ok") 并原样返回 null，spec §5.4）。
      */
-    async call(fn) {
+    async call(fn, opts) {
         const candidates = this.ordered(this.entries);
         const reasons = [];
         const throttleUntil = new Map();
+        const throttledEntries = [];
+        const coolingEntries = [];
         let attempts = 0;
-        let throttleBlocked = false;
-        let sawThrottle = false;
-        let sawOther = false;
         for (const e of candidates) {
             if (this.rateLimiter && !this.rateLimiter.hasToken(e.url)) {
-                throttleBlocked = true;
+                throttledEntries.push(e);
                 continue;
             }
-            if (!e.breaker.begin())
+            if (!e.breaker.begin()) {
+                coolingEntries.push(e);
                 continue;
+            }
             attempts += 1;
             try {
                 const result = await fn(e.client, e.url);
-                if (result === null || result === undefined) {
+                if (result === undefined || (result === null && !opts?.allowNull)) {
                     reasons.push(this.fail(e, new Error("返回 null")));
-                    sawOther = true;
+                    coolingEntries.push(e);
                     continue;
                 }
                 e.breaker.report("ok");
                 return result;
             }
             catch (error) {
-                const throttled = isLocalThrottle(error);
                 reasons.push(this.fail(e, error));
-                if (throttled) {
-                    sawThrottle = true;
-                    const ms = localThrottleRetryAfterMs(error);
+                if (isThrottleError(error)) {
+                    throttledEntries.push(e);
+                    const ms = throttleRetryAfterMs(error);
                     if (ms !== null)
                         throttleUntil.set(e.url, Math.max(throttleUntil.get(e.url) ?? 0, this.now() + ms));
                 }
-                else {
-                    sawOther = true;
+                else if (e.breaker.cooldownUntil > this.now()) {
+                    // fail() 后真正进入冷却（quota/rate/archive/transient/null）才入集合；
+                    // rejected/reverted/range 只 slide（cooldownUntil <= now）自然排除，防 ETA 被 0 污染
+                    coolingEntries.push(e);
                 }
             }
         }
-        if (attempts === 0) {
-            throw throttleBlocked ? this.throttledError(candidates, throttleUntil) : this.coolingError();
+        if (throttledEntries.length > 0) {
+            throw this.throttledError([...throttledEntries, ...coolingEntries], throttleUntil);
         }
-        if (sawThrottle && !sawOther)
-            throw this.throttledError(candidates, throttleUntil);
+        if (attempts === 0) {
+            throw this.coolingError();
+        }
         throw new Error(`RPC 全部 ${attempts} 端点失败: ${reasons.join(" | ").slice(0, 300)}`);
     }
     snapshot() {
@@ -164,8 +180,9 @@ export class RpcPool {
     /**
      * getLogs：与 call 同候选序，但先按 caps 与 lane 过滤（过滤后为空则用全体），
      * 再按端点在对应 lane 已学的范围预分块；范围超限在端点内自适应拆分（提取上限一次切到位/对半二分），
-     * 拆到 MIN_CHUNK 仍失败才滑下家。块号 bigint，from > to 返回 []。
+     * 拆到下限（minChunk，默认 MIN_CHUNK = 10n）仍失败才滑下家。块号 bigint，from > to 返回 []。
      * lane 缺省 "topic"；学习值按 lane 分桶（maxTopicRange / maxAddressRange），只收紧取历史最小。
+     * 混合失败裁决与 call 一致（spec §5.3）：存在本地受限候选即抛 PoolThrottledError。
      */
     async callLogs(range, fn, opts = {}) {
         const lane = opts.lane ?? "topic";
@@ -180,17 +197,18 @@ export class RpcPool {
         const ordered = this.ordered(candidates);
         const reasons = [];
         const throttleUntil = new Map();
+        const throttledEntries = [];
+        const coolingEntries = [];
         let attempts = 0;
-        let throttleBlocked = false;
-        let sawThrottle = false;
-        let sawOther = false;
         for (const e of ordered) {
             if (this.rateLimiter && !this.rateLimiter.hasToken(e.url)) {
-                throttleBlocked = true;
+                throttledEntries.push(e);
                 continue;
             }
-            if (!e.breaker.begin())
+            if (!e.breaker.begin()) {
+                coolingEntries.push(e);
                 continue;
+            }
             attempts += 1;
             try {
                 const span = range.toBlock - range.fromBlock + 1n;
@@ -206,24 +224,26 @@ export class RpcPool {
                 return out;
             }
             catch (error) {
-                const throttled = isLocalThrottle(error);
                 reasons.push(this.fail(e, error));
-                if (throttled) {
-                    sawThrottle = true;
-                    const ms = localThrottleRetryAfterMs(error);
+                if (isThrottleError(error)) {
+                    throttledEntries.push(e);
+                    const ms = throttleRetryAfterMs(error);
                     if (ms !== null)
                         throttleUntil.set(e.url, Math.max(throttleUntil.get(e.url) ?? 0, this.now() + ms));
                 }
-                else {
-                    sawOther = true;
+                else if (e.breaker.cooldownUntil > this.now()) {
+                    // fail() 后真正进入冷却（quota/rate/archive/transient/null）才入集合；
+                    // SlideSignal（rejected/reverted/range）只 slide，自然排除，防 ETA 被 0 污染
+                    coolingEntries.push(e);
                 }
             }
         }
-        if (attempts === 0) {
-            throw throttleBlocked ? this.throttledError(ordered, throttleUntil) : this.coolingError();
+        if (throttledEntries.length > 0) {
+            throw this.throttledError([...throttledEntries, ...coolingEntries], throttleUntil);
         }
-        if (sawThrottle && !sawOther)
-            throw this.throttledError(ordered, throttleUntil);
+        if (attempts === 0) {
+            throw this.coolingError();
+        }
         throw new Error(`RPC getLogs 全部 ${attempts} 端点失败: ${reasons.join(" | ").slice(0, 300)}`);
     }
     /** 端点内取一段范围；range 超限则自适应拆分递归，rejected/reverted/range到底 转滑动信号，其余按分型上抛。 */
@@ -235,11 +255,11 @@ export class RpcPool {
         catch (error) {
             const span = range.toBlock - range.fromBlock + 1n;
             const kind = kindOf(error);
-            if (kind === "range" && span > MIN_CHUNK) {
+            if (kind === "range" && span > this.minChunk) {
                 const parsed = error instanceof RpcKindError ? error.rangeLimit : rangeLimitFromMessage(error instanceof Error ? error.message : String(error));
-                // 能读出上限一次切到位，读不出对半二分；下限 MIN_CHUNK 兜底，学习值按 lane 分桶、取历史最小
+                // 能读出上限一次切到位，读不出对半二分；下限 minChunk 兜底，学习值按 lane 分桶、取历史最小
                 const chunk = parsed !== null && parsed < span ? parsed : (span + 1n) / 2n;
-                const eff = chunk > MIN_CHUNK ? chunk : MIN_CHUNK;
+                const eff = chunk > this.minChunk ? chunk : this.minChunk;
                 if (lane === "topic") {
                     e.maxTopicRange = e.maxTopicRange === null ? eff : (eff < e.maxTopicRange ? eff : e.maxTopicRange);
                 }
@@ -261,7 +281,7 @@ export class RpcPool {
     }
     /** 按分型处置单端点失败，返回脱敏原因供聚合报错。 */
     fail(e, error) {
-        if (isLocalThrottle(error)) {
+        if (isThrottleError(error)) {
             // 本地令牌桶节流非供应商故障：不计失败不冷却，仅终止在途探针
             e.breaker.slide();
             return `${hostOf(e.url)}: 本地限速`;

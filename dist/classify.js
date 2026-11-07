@@ -5,8 +5,8 @@ export class RpcKindError extends Error {
     retryAfterMs;
     constructor(kind, message, rangeLimit = null, 
     /** Retry-After 毫秒（调用方从响应头解析后携带）；冷却直取不进阶梯 */
-    retryAfterMs = null) {
-        super(message);
+    retryAfterMs = null, options) {
+        super(message, options);
         this.kind = kind;
         this.rangeLimit = rangeLimit;
         this.retryAfterMs = retryAfterMs;
@@ -29,8 +29,9 @@ export function parseRetryAfter(value, nowMs) {
 }
 // v0.4.0 分型拆分：rate = 短时限流（429/限速文案，30s×2 短梯）；quota = 硬额度（402/额度耗尽，2min×4 长梯）
 export const RATE_TEXT = /\b429\b|too many requests|rate[ -]?(?:limit|exceeded)|request rate/i;
-// quota 正则取两父实现的并集（flower: monthly；bn-alpha: upgrade here）
-export const QUOTA_TEXT = /\b(?:402|403)\b|usage limit|quota|credits?\s*[\s\S]*(?:limit|exhaust)|current plan|monthly|upgrade here/i;
+// quota 正则取两父实现的并集（flower: monthly；bn-alpha: upgrade here）；
+// v0.5.0 增补 free plan|plan limit：免费档 rate limit 文案归硬额度长梯而非 30s 短梯
+export const QUOTA_TEXT = /\b(?:402|403)\b|usage limit|quota|credits?\s*[\s\S]*(?:limit|exhaust)|current plan|free plan|plan limit|monthly|upgrade here/i;
 export const ARCHIVE_TEXT = /archive requests?|archive node|historical (?:data|state)|personal token/i;
 const REVERT_TEXT = /execution reverted/i;
 const RANGE_LIMIT_PATTERNS = [
@@ -58,7 +59,9 @@ export function isContractRevertMessage(msg) {
     return REVERT_TEXT.test(msg);
 }
 /**
- * 通用文本分型，序：range → reverted → quota → archive → transient。
+ * 通用文本分型，序锁定：range → reverted → quota → rate → archive → transient。
+ * range 最高优先：防 "up to a 10 block range... upgrade your plan" 被套餐尾巴文案误判 quota；
+ * quota 先于 rate："You reached free plan rate limit" 等套餐限流归硬额度长梯而非 30s 短梯。
  * "rejected"（端点健康但本次无法满足）只在 fetch 工厂能区分「200 带 JSON-RPC error」时产生，
  * 文本层面不可判，故本函数不返回它。
  */
@@ -68,10 +71,10 @@ export function classifyRpcError(error) {
         return "range";
     if (REVERT_TEXT.test(msg))
         return "reverted";
-    if (RATE_TEXT.test(msg))
-        return "rate";
     if (QUOTA_TEXT.test(msg))
         return "quota";
+    if (RATE_TEXT.test(msg))
+        return "rate";
     if (ARCHIVE_TEXT.test(msg))
         return "archive";
     return "transient";

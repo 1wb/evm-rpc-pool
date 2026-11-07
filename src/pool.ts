@@ -43,6 +43,9 @@ export interface RpcPoolOptions {
   /** 共享令牌桶（同凭据跨池共用）；注入后候选层 hasToken 预判 + 全受限聚合成 PoolThrottledError。
    *  权威扣费仍在其下 fetchFn 的 acquireAndWait——本层预判只是快速跳过。 */
   rateLimiter?: KeyRateLimiter;
+  /** 可选外部断路器工厂（如 `(url) => registry.get(url)`）；缺省每池每条目独立创建私有 EndpointBreaker。
+   *  注意：切勿将同一 EndpointBreaker 实例同时用于本池与内层 fetchImpl 包装，否则半开单探针互斥锁会重入自锁。 */
+  breakerFor?: (url: string) => EndpointBreaker;
 }
 
 /** 全部端点均在冷却（含探针在途）时抛出，带最早可重试时间与脱敏标签。 */
@@ -118,13 +121,15 @@ export class RpcPool<C> {
       return {
         ...e,
         keyId: `${host}#k${seq}`,
-        breaker: new EndpointBreaker({
-          now: opts.now,
-          quota: opts.quota,
-          rate: opts.rate,
-          archive: opts.archive,
-          transient: opts.transient,
-        }),
+        breaker: opts.breakerFor
+          ? opts.breakerFor(e.url)
+          : new EndpointBreaker({
+              now: opts.now,
+              quota: opts.quota,
+              rate: opts.rate,
+              archive: opts.archive,
+              transient: opts.transient,
+            }),
         maxTopicRange: capsInitial(e.caps?.topicLogRange),
         maxAddressRange: capsInitial(e.caps?.addressLogRange),
       };

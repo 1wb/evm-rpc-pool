@@ -43,3 +43,26 @@ export declare class EndpointBreaker {
         cooldownSec: number;
     };
 }
+/**
+ * 按完整 URL 懒创建/共享 EndpointBreaker 的注册表：多池经 `breakerFor: (url) => registry.get(url)`
+ * 注入即共享冷却与半开探针状态。只读观测（snapshot）不脏建实例；setPenalty 未建实例也会初始化并写入。
+ * 注意：同一 EndpointBreaker 实例不得同时用于外层池与内层 fetchImpl 包装（半开单探针互斥锁会重入自锁）。
+ */
+export declare class BreakerRegistry {
+    private readonly map;
+    private readonly opts;
+    private readonly now;
+    constructor(opts?: EndpointBreakerOptions);
+    /** 按完整 URL 懒获取/创建对应的 EndpointBreaker 实例。 */
+    get(url: string): EndpointBreaker;
+    has(url: string): boolean;
+    /** 对该 URL 写入 Retry-After 绝对截止时间边带（未建实例也会初始化并写入）。 */
+    setPenalty(url: string, untilMs: number): void;
+    /** 只读快照：未触碰过的健康 URL 直接返回 { failures: 0, cooldownSec: 0 } 且无需分配实例。 */
+    snapshot(url: string, now?: number): {
+        failures: number;
+        cooldownSec: number;
+    };
+    /** 清空全部已建断路器（供测试重入重置）。 */
+    clear(): void;
+}

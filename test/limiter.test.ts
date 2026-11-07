@@ -125,6 +125,40 @@ describe("KeyRateLimiter 令牌桶", () => {
   });
 });
 
+describe("KeyRateLimiter 自省与脱敏 snapshot", () => {
+  it("isRegistered / penaltyUntil / endpoints（反映同组取 min 速率）与 snapshot 严格脱敏凭据 URL（Review Focus #5）", async () => {
+    const clock = makeClock();
+    const lim = new KeyRateLimiter({ now: clock.now, sleep: tickingSleep(clock) });
+    const secretUrl = "https://rpc.example/v1?api_key=SECRET_TOKEN_999";
+    const groupA = "https://a.example/k1";
+    const groupB = "https://b.example/k1";
+    lim.registerEndpoints([
+      { url: secretUrl, reqPerMin: 60 },
+      { url: groupA, budget: "shared-key", reqPerMin: 120 },
+      { url: groupB, budget: "shared-key", reqPerMin: 60 }, // 同组压低到 60
+    ]);
+    expect(lim.isRegistered(secretUrl)).toBe(true);
+    expect(lim.isRegistered("https://unregistered.example")).toBe(false);
+    lim.setPenalty(secretUrl, clock.now() + 15_000);
+    expect(lim.penaltyUntil(secretUrl)).toBe(1_015_000);
+
+    const eps = lim.endpoints();
+    expect(eps.find((e) => e.url === groupA)?.reqPerMin).toBe(60);
+
+    const snap = lim.snapshot();
+    expect(snap[0]).toEqual({
+      alias: "rpc.example#k1",
+      budget: "rpc.example#k1", // 原始 budget===url 被替换为 alias
+      reqPerMin: 60,
+      hasToken: false,
+      penaltyUntilSec: 15,
+      tokenRecoverySec: 15,
+    });
+    expect(JSON.stringify(snap)).not.toContain("SECRET_TOKEN_999");
+    expect(JSON.stringify(snap)).not.toContain("https://");
+  });
+});
+
 describe("isLocalThrottle cause 链识别", () => {
   it("顶层即 LocalThrottleError", () => {
     expect(isLocalThrottle(new LocalThrottleError(1000))).toBe(true);

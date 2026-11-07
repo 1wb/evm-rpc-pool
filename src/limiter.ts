@@ -77,6 +77,26 @@ export interface KeyRateLimiterOptions {
   onPenalty?: (url: string, untilMs: number) => void;
 }
 
+/** 已登记端点的内部关联信息（含原始 url，仅供服务端内部关联 PoolMeter / BreakerRegistry 使用）。 */
+export interface LimiterEndpointInfo {
+  url: string;
+  alias: string;
+  budget: string;
+  reqPerMin: number;
+}
+
+/** 完全脱敏的观测快照行（监控 /api/metrics 用）：零原始 URL、零凭据子串。 */
+export interface LimiterEndpointSnapshot {
+  /** 脱敏别名 host#kN */
+  alias: string;
+  /** 预算组键；若原始 budget === url（无显式组键的独享端点），自动替换为 alias 防泄露 URL */
+  budget: string;
+  reqPerMin: number;
+  hasToken: boolean;
+  penaltyUntilSec: number;
+  tokenRecoverySec: number;
+}
+
 /**
  * endpointId/budgetKey 双层令牌桶：url → bucket（budget ?? url）。
  * 未登记 URL 一律放行（漏登记不致不可用）；权威扣费点在 fetchFn 的 acquireAndWait。
@@ -176,6 +196,44 @@ export class KeyRateLimiter {
   /** 脱敏别名 host#kN（按 host 计数，启动顺序稳定）。 */
   urlAlias(url: string): string {
     return this.urlRegistry.get(url)?.alias ?? hostOf(url);
+  }
+
+  /** 该 URL 是否已登记（漏登记的 URL 一律放行，此处供消费端核对台账覆盖面）。 */
+  isRegistered(url: string): boolean {
+    return this.urlRegistry.has(url);
+  }
+
+  /** Retry-After 边带绝对截止时刻；未登记/未设罚 = 0。 */
+  penaltyUntil(url: string): number {
+    return this.bucketOf(url)?.penaltyUntil ?? 0;
+  }
+
+  /** 按登记顺序返回已登记端点 { url, alias, budget, reqPerMin }（reqPerMin 取桶当前生效值，
+   *  准确反映同组取 min 后的真实速率；供服务端内部关联 PoolMeter / BreakerRegistry 使用）。 */
+  endpoints(): LimiterEndpointInfo[] {
+    const out: LimiterEndpointInfo[] = [];
+    for (const [url, reg] of this.urlRegistry) {
+      out.push({
+        url,
+        alias: reg.alias,
+        budget: reg.budget,
+        reqPerMin: this.buckets.get(reg.budget)?.reqPerMin ?? 0,
+      });
+    }
+    return out;
+  }
+
+  /** 完全脱敏观测快照：零原始 URL、零凭据子串；budget === url 的独享端点回退为 alias（host#kN）。 */
+  snapshot(): LimiterEndpointSnapshot[] {
+    const now = this.now();
+    return this.endpoints().map((e) => ({
+      alias: e.alias,
+      budget: e.budget === e.url ? e.alias : e.budget,
+      reqPerMin: e.reqPerMin,
+      hasToken: this.hasToken(e.url),
+      penaltyUntilSec: Math.max(0, Math.ceil((this.penaltyUntil(e.url) - now) / 1000)),
+      tokenRecoverySec: Math.max(0, Math.ceil((this.earliestTokenRecovery(e.url) - now) / 1000)),
+    }));
   }
 
   private bucketOf(url: string): BudgetBucket | undefined {
