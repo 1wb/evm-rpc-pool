@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { RpcPool, type RpcPoolEntry, type RpcPoolOptions } from "../src/pool";
+import { PoolThrottledError, RpcPool, type RpcPoolEntry, type RpcPoolOptions } from "../src/pool";
+import { LocalThrottleError } from "../src/limiter";
 
 const URL_A = "https://a.example/rpc";
 const URL_B = "https://b.example/rpc";
@@ -107,6 +108,21 @@ describe("RpcPool.callLogs", () => {
     for (const bad of [0, -1, 0n, -10n, 1.5, Number.NaN]) {
       expect(() => new RpcPool([{ url: URL_A, client: "A" }], { minChunk: bad as number })).toThrow(/minChunk/);
     }
+  });
+
+  it("callLogs 混合失败 [A rejected 滑移 + B 抛 LocalThrottleError(5000)] → 抛 PoolThrottledError(5000)", async () => {
+    const pool = new RpcPool<string>([
+      { url: URL_A, client: "A" },
+      { url: URL_B, client: "B" },
+    ]);
+    const err = await pool
+      .callLogs({ fromBlock: 1n, toBlock: 10n }, async (c) => {
+        if (c === "A") throw new Error("execution reverted");
+        throw new LocalThrottleError(5000);
+      })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(PoolThrottledError);
+    expect((err as PoolThrottledError).retryAfterMs).toBe(5000);
   });
 });
 

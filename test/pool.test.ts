@@ -201,6 +201,34 @@ describe("RpcPool 本地限速（rateLimiter 注入）", () => {
     await expect(pool.call(async () => { throw new RpcKindError("quota", "HTTP 402"); })).rejects.toThrow(/全部 2 端点失败/);
     await expect(pool.call(async (c) => c)).rejects.toBeInstanceOf(PoolCoolingError);
   });
+
+  it("三态混合失败 [A rejected 滑移, B 429 冷却 30s, C !hasToken 2s 后恢复] → 抛 PoolThrottledError(2000)", async () => {
+    const clock = makeClock();
+    const limiter = new KeyRateLimiter({ now: clock.now, sleep: tickingSleep(clock) });
+    limiter.registerEndpoints([
+      { url: URL_A, reqPerMin: 60 },
+      { url: URL_B, reqPerMin: 60 },
+      { url: URL_C, reqPerMin: 30 }, // 2s / 令牌
+    ]);
+    while (limiter.hasToken(URL_C)) await limiter.acquireAndWait(URL_C, 10); // 打满 C（2000ms 后恢复）
+    const pool = new RpcPool<string>(
+      [
+        { url: URL_A, client: "A" },
+        { url: URL_B, client: "B" },
+        { url: URL_C, client: "C" },
+      ],
+      { now: clock.now, rateLimiter: limiter },
+    );
+    const err = await pool
+      .call(async (c) => {
+        if (c === "A") throw new RpcKindError("rejected", "method not found");
+        if (c === "B") throw new RpcKindError("rate", "HTTP 429");
+        return c;
+      })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(PoolThrottledError);
+    expect((err as PoolThrottledError).retryAfterMs).toBe(2000);
+  });
 });
 
 describe("RpcPool.snapshot keyId", () => {

@@ -155,49 +155,55 @@ export class RpcPool<C> {
   /**
    * 粘性优先通用调用：恒按构造序过滤冷却端点，从首个开始试；
    * rejected/reverted 滑下家不冷却，quota/archive/transient 冷却后滑下家，ok 清零。
-   * 注入 rateLimiter 时无令牌候选直接跳过；全部候选本地受限抛 PoolThrottledError（静默延期语义）。
+   * 注入 rateLimiter 时无令牌候选直接跳过；存在本地受限候选时（无论是否混入其他失败）
+   * 统一抛 PoolThrottledError（静默延期语义，spec §5.3）。
    * 回调返回 null/undefined 视同 transient（对合法返回 null 的方法请自行包 sentinel）。
    */
   async call<T>(fn: (client: C, url: string) => Promise<T>): Promise<T> {
     const candidates = this.ordered(this.entries);
     const reasons: string[] = [];
     const throttleUntil = new Map<string, number>();
+    const throttledEntries: EntryState<C>[] = [];
+    const coolingEntries: EntryState<C>[] = [];
     let attempts = 0;
-    let throttleBlocked = false;
-    let sawThrottle = false;
-    let sawOther = false;
     for (const e of candidates) {
       if (this.rateLimiter && !this.rateLimiter.hasToken(e.url)) {
-        throttleBlocked = true;
+        throttledEntries.push(e);
         continue;
       }
-      if (!e.breaker.begin()) continue;
+      if (!e.breaker.begin()) {
+        coolingEntries.push(e);
+        continue;
+      }
       attempts += 1;
       try {
         const result = await fn(e.client, e.url);
         if (result === null || result === undefined) {
           reasons.push(this.fail(e, new Error("返回 null")));
-          sawOther = true;
+          coolingEntries.push(e);
           continue;
         }
         e.breaker.report("ok");
         return result;
       } catch (error) {
-        const throttled = isThrottleError(error);
         reasons.push(this.fail(e, error));
-        if (throttled) {
-          sawThrottle = true;
+        if (isThrottleError(error)) {
+          throttledEntries.push(e);
           const ms = throttleRetryAfterMs(error);
           if (ms !== null) throttleUntil.set(e.url, Math.max(throttleUntil.get(e.url) ?? 0, this.now() + ms));
-        } else {
-          sawOther = true;
+        } else if (e.breaker.cooldownUntil > this.now()) {
+          // fail() 后真正进入冷却（quota/rate/archive/transient/null）才入集合；
+          // rejected/reverted/range 只 slide（cooldownUntil <= now）自然排除，防 ETA 被 0 污染
+          coolingEntries.push(e);
         }
       }
     }
-    if (attempts === 0) {
-      throw throttleBlocked ? this.throttledError(candidates, throttleUntil) : this.coolingError();
+    if (throttledEntries.length > 0) {
+      throw this.throttledError([...throttledEntries, ...coolingEntries], throttleUntil);
     }
-    if (sawThrottle && !sawOther) throw this.throttledError(candidates, throttleUntil);
+    if (attempts === 0) {
+      throw this.coolingError();
+    }
     throw new Error(`RPC 全部 ${attempts} 端点失败: ${reasons.join(" | ").slice(0, 300)}`);
   }
 
@@ -232,6 +238,7 @@ export class RpcPool<C> {
    * 再按端点在对应 lane 已学的范围预分块；范围超限在端点内自适应拆分（提取上限一次切到位/对半二分），
    * 拆到下限（minChunk，默认 MIN_CHUNK = 10n）仍失败才滑下家。块号 bigint，from > to 返回 []。
    * lane 缺省 "topic"；学习值按 lane 分桶（maxTopicRange / maxAddressRange），只收紧取历史最小。
+   * 混合失败裁决与 call 一致（spec §5.3）：存在本地受限候选即抛 PoolThrottledError。
    */
   async callLogs<T>(
     range: BlockRange,
@@ -248,16 +255,18 @@ export class RpcPool<C> {
     const ordered = this.ordered(candidates);
     const reasons: string[] = [];
     const throttleUntil = new Map<string, number>();
+    const throttledEntries: EntryState<C>[] = [];
+    const coolingEntries: EntryState<C>[] = [];
     let attempts = 0;
-    let throttleBlocked = false;
-    let sawThrottle = false;
-    let sawOther = false;
     for (const e of ordered) {
       if (this.rateLimiter && !this.rateLimiter.hasToken(e.url)) {
-        throttleBlocked = true;
+        throttledEntries.push(e);
         continue;
       }
-      if (!e.breaker.begin()) continue;
+      if (!e.breaker.begin()) {
+        coolingEntries.push(e);
+        continue;
+      }
       attempts += 1;
       try {
         const span = range.toBlock - range.fromBlock + 1n;
@@ -273,21 +282,24 @@ export class RpcPool<C> {
         e.breaker.report("ok");
         return out;
       } catch (error) {
-        const throttled = isThrottleError(error);
         reasons.push(this.fail(e, error));
-        if (throttled) {
-          sawThrottle = true;
+        if (isThrottleError(error)) {
+          throttledEntries.push(e);
           const ms = throttleRetryAfterMs(error);
           if (ms !== null) throttleUntil.set(e.url, Math.max(throttleUntil.get(e.url) ?? 0, this.now() + ms));
-        } else {
-          sawOther = true;
+        } else if (e.breaker.cooldownUntil > this.now()) {
+          // fail() 后真正进入冷却（quota/rate/archive/transient/null）才入集合；
+          // SlideSignal（rejected/reverted/range）只 slide，自然排除，防 ETA 被 0 污染
+          coolingEntries.push(e);
         }
       }
     }
-    if (attempts === 0) {
-      throw throttleBlocked ? this.throttledError(ordered, throttleUntil) : this.coolingError();
+    if (throttledEntries.length > 0) {
+      throw this.throttledError([...throttledEntries, ...coolingEntries], throttleUntil);
     }
-    if (sawThrottle && !sawOther) throw this.throttledError(ordered, throttleUntil);
+    if (attempts === 0) {
+      throw this.coolingError();
+    }
     throw new Error(`RPC getLogs 全部 ${attempts} 端点失败: ${reasons.join(" | ").slice(0, 300)}`);
   }
 
