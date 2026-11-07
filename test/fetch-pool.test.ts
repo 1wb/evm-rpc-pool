@@ -161,8 +161,11 @@ describe("FetchRpcPool.call", () => {
   });
 
   it("fetchImpl 抛 LocalThrottleError（含包装 cause）时原样透传为 PoolThrottledError，端点零冷却", async () => {
+    // 剩余时间按抛出时刻折算（until - now()），须用假时钟保证确定性
+    const clock = makeClock();
     const pool = new FetchRpcPool([URL_A], {
       fetchImpl: async () => { throw new Error("wrapped", { cause: new LocalThrottleError(2500) }); },
+      now: clock.now,
     });
     const err = await pool.call("eth_blockNumber", []).catch((e) => e);
     expect(err).toBeInstanceOf(PoolThrottledError);
