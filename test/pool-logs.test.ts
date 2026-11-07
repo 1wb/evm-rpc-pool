@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { RpcPool, type RpcPoolEntry } from "../src/pool";
+import { RpcPool, type RpcPoolEntry, type RpcPoolOptions } from "../src/pool";
 
 const URL_A = "https://a.example/rpc";
 const URL_B = "https://b.example/rpc";
 
 type Logs = Array<{ block: bigint }>;
 
-function makePool(entries: RpcPoolEntry<string>[]) {
-  return new RpcPool<string>(entries);
+function makePool(entries: RpcPoolEntry<string>[], opts?: RpcPoolOptions) {
+  return new RpcPool<string>(entries, opts);
 }
 
 describe("RpcPool.callLogs", () => {
@@ -47,10 +47,13 @@ describe("RpcPool.callLogs", () => {
   it("读不出上限对半二分，拆到 MIN_CHUNK 仍失败滑下家（下家收到整段）", async () => {
     const spans: bigint[] = [];
     let bArgs: Array<[bigint, bigint]> = [];
-    const pool = makePool([
-      { url: URL_A, client: "A" },
-      { url: URL_B, client: "B" },
-    ]);
+    const pool = makePool(
+      [
+        { url: URL_A, client: "A" },
+        { url: URL_B, client: "B" },
+      ],
+      { minChunk: 2000n }, // 锁旧地板场景：对半二分到 2000n 即触底滑动
+    );
     const logs = await pool.callLogs<Logs>({ fromBlock: 0n, toBlock: 9999n }, async (c, r) => {
       if (c === "A") {
         spans.push(r.toBlock - r.fromBlock + 1n);
@@ -85,6 +88,26 @@ describe("RpcPool.callLogs", () => {
     expect(logs).toEqual([]);
     expect(calls).toBe(0);
   });
+
+  it("默认 minChunk=10n：窄跨度（100 块）命中 25 块上限时一次切到位并记忆", async () => {
+    const spans: bigint[] = [];
+    const pool = new RpcPool<string>([{ url: URL_A, client: "A" }]);
+    const logs = await pool.callLogs<Logs>({ fromBlock: 100n, toBlock: 199n }, async (_c, r) => {
+      const span = r.toBlock - r.fromBlock + 1n;
+      spans.push(span);
+      if (span > 25n) throw new Error("range must not exceed 25");
+      return [{ block: r.toBlock }];
+    });
+    expect(logs).toHaveLength(4);
+    expect(spans).toEqual([100n, 25n, 25n, 25n, 25n]);
+    expect(pool.snapshot()[0].maxTopicRange).toBe(25n);
+  });
+
+  it("非法 minChunk（0、负数、小数、NaN）构造即抛错", () => {
+    for (const bad of [0, -1, 0n, -10n, 1.5, Number.NaN]) {
+      expect(() => new RpcPool([{ url: URL_A, client: "A" }], { minChunk: bad as number })).toThrow(/minChunk/);
+    }
+  });
 });
 
 describe("v0.2.0 数值 caps 与分桶学习", () => {
@@ -92,9 +115,10 @@ describe("v0.2.0 数值 caps 与分桶学习", () => {
   const URL_B = "https://b.example/rpc";
 
   it("caps 数值初始值按 lane 独立预分块，学习只收紧各自通道", async () => {
-    const pool = new RpcPool<string>([
-      { url: URL_A, client: "A", caps: { topicLogRange: 3000, addressLogRange: 8000 } },
-    ]);
+    const pool = new RpcPool<string>(
+      [{ url: URL_A, client: "A", caps: { topicLogRange: 3000, addressLogRange: 8000 } }],
+      { minChunk: 2000n }, // 锁旧地板场景：拆到 2000n 仍超限 → 无下家可滑、整单失败
+    );
     const topicSpans: bigint[] = [];
     const addrSpans: bigint[] = [];
     await pool.callLogs<unknown[]>({ fromBlock: 0n, toBlock: 9999n },

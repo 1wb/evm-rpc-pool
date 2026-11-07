@@ -27,8 +27,12 @@ export type PoolSelection = "priority" | "rotation";
 export interface RpcPoolOptions {
   now?: () => number;
   quota?: BreakerTuning;
+  /** rate（429 短时限流）分型冷却调参；缺省用 DEFAULT_TUNING.rate（30s ×2 短梯） */
+  rate?: BreakerTuning;
   archive?: BreakerTuning;
   transient?: BreakerTuning;
+  /** getLogs 自适应拆分的最小块跨度下限（默认 MIN_CHUNK = 10n；必须 >= 1） */
+  minChunk?: number | bigint;
   /** 候选排序：'priority'（默认）恒按构造序过滤冷却从首个试起；'rotation' 从轮转指针起
    *  对活端点循环排列（冷却端点当轮不占候选位；全冷却时对全体循环兜底保进度）。 */
   selection?: PoolSelection;
@@ -69,6 +73,17 @@ function capsInitial(n: number | undefined): bigint | null {
   return n != null && n > 0 ? BigInt(n) : null;
 }
 
+/** minChunk 选项 → bigint 下限；缺省取 MIN_CHUNK，非法（<1、非整数、NaN）构造即抛。 */
+function resolveMinChunk(raw: number | bigint | undefined): bigint {
+  if (raw === undefined) return MIN_CHUNK;
+  if (typeof raw === "bigint") {
+    if (raw < 1n) throw new Error("RpcPool: minChunk 必须 >= 1");
+    return raw;
+  }
+  if (!Number.isInteger(raw) || raw < 1) throw new Error("RpcPool: minChunk 必须 >= 1");
+  return BigInt(raw);
+}
+
 /** 数值 caps 的 lane 支持判定：缺省视为支持，<=0 视同不支持该 lane。 */
 function laneSupported(n: number | undefined): boolean {
   return n === undefined || n > 0;
@@ -93,6 +108,7 @@ export class RpcPool<C> {
   private readonly now: () => number;
   private readonly selection: PoolSelection;
   private readonly rateLimiter?: KeyRateLimiter;
+  private readonly minChunk: bigint;
   private rotationIndex = 0;
 
   constructor(entries: readonly RpcPoolEntry<C>[], opts: RpcPoolOptions = {}) {
@@ -100,6 +116,7 @@ export class RpcPool<C> {
     this.now = opts.now ?? Date.now;
     this.selection = opts.selection ?? "priority";
     this.rateLimiter = opts.rateLimiter;
+    this.minChunk = resolveMinChunk(opts.minChunk);
     const hostSeq = new Map<string, number>();
     this.entries = entries.map((e) => {
       const host = hostOf(e.url);
@@ -111,6 +128,7 @@ export class RpcPool<C> {
         breaker: new EndpointBreaker({
           now: opts.now,
           quota: opts.quota,
+          rate: opts.rate,
           archive: opts.archive,
           transient: opts.transient,
         }),
@@ -219,7 +237,7 @@ export class RpcPool<C> {
   /**
    * getLogs：与 call 同候选序，但先按 caps 与 lane 过滤（过滤后为空则用全体），
    * 再按端点在对应 lane 已学的范围预分块；范围超限在端点内自适应拆分（提取上限一次切到位/对半二分），
-   * 拆到 MIN_CHUNK 仍失败才滑下家。块号 bigint，from > to 返回 []。
+   * 拆到下限（minChunk，默认 MIN_CHUNK = 10n）仍失败才滑下家。块号 bigint，from > to 返回 []。
    * lane 缺省 "topic"；学习值按 lane 分桶（maxTopicRange / maxAddressRange），只收紧取历史最小。
    */
   async callLogs<T>(
@@ -293,12 +311,12 @@ export class RpcPool<C> {
     } catch (error) {
       const span = range.toBlock - range.fromBlock + 1n;
       const kind = kindOf(error);
-      if (kind === "range" && span > MIN_CHUNK) {
+      if (kind === "range" && span > this.minChunk) {
         const parsed =
           error instanceof RpcKindError ? error.rangeLimit : rangeLimitFromMessage(error instanceof Error ? error.message : String(error));
-        // 能读出上限一次切到位，读不出对半二分；下限 MIN_CHUNK 兜底，学习值按 lane 分桶、取历史最小
+        // 能读出上限一次切到位，读不出对半二分；下限 minChunk 兜底，学习值按 lane 分桶、取历史最小
         const chunk = parsed !== null && parsed < span ? parsed : (span + 1n) / 2n;
-        const eff = chunk > MIN_CHUNK ? chunk : MIN_CHUNK;
+        const eff = chunk > this.minChunk ? chunk : this.minChunk;
         if (lane === "topic") {
           e.maxTopicRange = e.maxTopicRange === null ? eff : (eff < e.maxTopicRange ? eff : e.maxTopicRange);
         } else {

@@ -1,4 +1,4 @@
-export const MIN_CHUNK = 2_000n;
+export const MIN_CHUNK = 10n;
 
 export interface BlockRange {
   fromBlock: bigint;

@@ -13,8 +13,8 @@ describe("splitBlockRange", () => {
   it("from > to 返回空", () => {
     expect(splitBlockRange(10n, 9n, 100n)).toEqual([]);
   });
-  it("MIN_CHUNK 为 2000n，chunk < 1 抛错", () => {
-    expect(MIN_CHUNK).toBe(2000n);
+  it("MIN_CHUNK 为 10n，chunk < 1 抛错", () => {
+    expect(MIN_CHUNK).toBe(10n);
     expect(() => splitBlockRange(0n, 10n, 0n)).toThrow();
   });
 });

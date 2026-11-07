@@ -191,7 +191,7 @@ describe("FetchRpcPool.getLogs", () => {
         return ok([{ full: true }]);
       },
     });
-    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn });
+    const pool = new FetchRpcPool([URL_A, URL_B], { fetchImpl: fn, minChunk: 2000n }); // 锁旧地板场景
     const logs = await pool.getLogs<{ full: boolean }>({ address: "0xp", topics: ["0xt"], fromBlock: 0n, toBlock: 9999n });
     expect(logs).toEqual([{ full: true }]);
     const spans = calls

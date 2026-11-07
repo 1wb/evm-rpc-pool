@@ -97,6 +97,16 @@ describe("RpcPool.call 粘性优先", () => {
     expect(pool.snapshot()[0].cooldownSec).toBe(30);
   });
 
+  it("RpcPoolOptions.rate 调参透传至内部 EndpointBreaker", async () => {
+    const clock = makeClock();
+    const pool = twoPool({ now: clock.now, rate: { baseMs: 5_000, factor: 2, capMs: 10_000 } });
+    expect(await pool.call(async (c) => {
+      if (c === "A") throw new RpcKindError("rate", "HTTP 429");
+      return c;
+    })).toBe("B");
+    expect(pool.snapshot()[0].cooldownSec).toBe(5);
+  });
+
   it("全失败给聚合报错；再调用全冷却抛 PoolCoolingError", async () => {
     const clock = makeClock();
     const pool = twoPool({ now: clock.now });
